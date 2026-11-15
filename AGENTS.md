@@ -62,7 +62,8 @@ On Samsung phones, if debugging is greyed out or mouse input is blocked, the use
 should turn off **Settings › Security and privacy › Auto Blocker**.
 
 Then tell them: **Super + Alt + P** opens a phone app, **Super + Alt + Shift + P**
-mirrors the phone, and the phone icon in the bar has everything else.
+mirrors the phone, **Super + Alt + V** switches a window's sound between the
+computer and the phone, and the phone icon in the bar has everything else.
 
 If the user wants to use the phone away from home, check that `tailscale status`
 lists the phone. Remote use then works by itself once the phone has connected
@@ -89,6 +90,8 @@ This keeps scrcpy, adb and the user's settings in `~/.config/phonelink`.
 - Don't edit anything in `/usr/share/omarchy`.
 - Don't run `phonelink stop` or `phonelink direct off` while the user has phone
   windows open, unless they ask. Both close the connection those windows use.
+- To see which path the phone uses and where each address came from, run
+  `phonelink network`.
 - For lag or dropouts, run `phonelink doctor` first, then read
   `~/.local/state/phonelink/logs/sessions.log`, which records each window's
   quality changes and reconnections. More in

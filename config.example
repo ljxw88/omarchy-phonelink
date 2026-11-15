@@ -14,6 +14,11 @@
 # Density of single-app windows. Higher = bigger text and buttons.
 # APP_DPI=200
 
+# Where a phone window's sound plays until you switch it (Super + Alt + V, or
+# the speaker button in the bar panel): "pc" or "phone". Your switch is
+# remembered for each app and the mirror.
+# SOUND="pc"
+
 # App icons for the dock, launcher and bar come from each app's Google Play
 # page, which tells Google the app's package name. "off" uses a generic icon.
 # APP_ICONS="play"

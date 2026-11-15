@@ -5,7 +5,9 @@
 - [Requirements](#requirements)
 - [What the installer changes](#what-the-installer-changes)
 - [The bar icon](#the-bar-icon)
+- [The network map](#the-network-map)
 - [Inside a phone window](#inside-a-phone-window)
+- [Sound](#sound)
 - [Commands](#commands)
 - [Settings](#settings)
 - [The direct Wi-Fi link](#the-direct-wi-fi-link)
@@ -54,16 +56,46 @@ color while a phone window is open.
 
 - **Left click** opens a panel with:
   - the phone's name and how it's connected;
-  - Mirror, and your recent and pinned apps;
+  - Mirror, and your recent and pinned apps, each with a sound button;
   - the Direct Wi-Fi link switch;
   - Disconnect, or Connect and Pair when no phone is connected.
 
-  In the panel, arrow keys or j/k move, Enter opens and Esc closes.
+  In the panel, arrow keys or j/k move, Enter opens, S switches the sound and
+  Esc closes.
 - **Right click** mirrors the phone.
 - **Middle click** opens the full app list.
 
 Move it by dragging it along the bar, or with
 `omarchy bar move phonelink.panel --section <section>`.
+
+## The network map
+
+**Bar icon › Network map** (or `phonelink network --panel`, or **N** in the
+panel) shows every way this computer has to the phone, as a lane between the
+two, with the address at each end:
+
+| Lane | This computer's address | The phone's address |
+|---|---|---|
+| USB | None; the cable carries it | None; adb uses the phone's serial number |
+| Direct Wi-Fi | Handed out by the phone, which runs the link | Always 192.168.49.1 on a link the phone runs |
+| Wi-Fi | Handed out by your router (DHCP) | Handed out by your router. phonelink finds it in the phone's mDNS announcement |
+| Tailscale | Assigned by Tailscale | Assigned by Tailscale. phonelink notes it while the phone is nearby |
+
+The port after the phone's address is its Wireless debugging port. It's the
+same on every network the phone is on, and changes each time Wireless
+debugging is turned on.
+
+The lane in use is drawn in your theme's accent color, with traffic flowing
+from the phone to this computer, and shows its round trip, data rate and any
+backlog. A solid line is connected but idle; a dashed one could connect. The
+Wi-Fi lane shows your router in the middle, and the Tailscale lane whether
+traffic goes direct or through a relay. Point at a lane, or move to it with
+the arrow keys, to read where its addresses came from. Below the lanes are the
+router, where the debugging port came from, the phone's mobile data address
+(from its carrier, and not reachable from here), and what's streaming.
+
+`phonelink network` prints the same map in a terminal, and
+`phonelink network --json` gives it as data.
 
 ## Inside a phone window
 
@@ -73,6 +105,7 @@ Move it by dragging it along the bar, or with
 | Home | **Super + H** or middle-click |
 | Notification panel | **Super + N** |
 | Rotate | **Super + R** |
+| Sound on this computer or the phone | **Super + Alt + V** |
 | Float the window | **Super + T** |
 
 Copy and paste work both ways. Drag a file onto a window to send it to the
@@ -81,6 +114,25 @@ phone, or drag an APK to install it.
 Each phone app runs on its own virtual display that resizes with its tile, so
 it lays itself out like a desktop app and leaves the phone's own screen free.
 The mirror keeps the phone's shape inside its tile.
+
+## Sound
+
+Switch a phone window's sound between **this computer** (the default) and
+**the phone** with **Super + Alt + V** in the window, or with the speaker
+button on its row in the bar panel. The sound moves right away.
+
+Android mixes every app's sound into one output, so phone windows share one
+sound: switching one moves it for all open phone windows. Each app and the
+mirror remembers its setting, and opening a window set to this computer brings
+the sound here. Opening one set to the phone leaves the sound where it is.
+When the last phone window closes, the sound goes back to the phone.
+
+In the bar panel, an open window's speaker button shows where the sound plays
+now. For an app that isn't open, it shows where its sound will play when it
+opens.
+
+While the sound plays here, the phone's speaker is silent. It goes to this
+computer's current output, as set in Omarchy's audio panel.
 
 ## Commands
 
@@ -92,6 +144,8 @@ phonelink pin          Choose which phone apps appear in the app launcher
 phonelink pair         Pair over Wi-Fi with a QR code
 phonelink connect      Connect to a paired phone, nearby or over Tailscale
 phonelink connect <port>  Reach the phone over Tailscale at this Wireless debugging port
+phonelink sound [pc|phone|toggle] [mirror|<pkg>]
+                       Play a window's sound on this computer or the phone
 phonelink direct       Link straight to the phone with Wi-Fi Direct
 phonelink direct off   Drop the direct link
 phonelink wifi         Switch a USB-connected phone to Wi-Fi
@@ -99,6 +153,8 @@ phonelink stop         Close phone windows and drop all connections
 phonelink refresh      Re-read the app list from the phone
 phonelink status       Show connected phones and open windows
 phonelink doctor       Check for common causes of lag and dropouts
+phonelink network      Show every way to the phone, with addresses and where they came from
+phonelink network --panel  Open the network map in the bar
 ```
 
 ## Settings
@@ -110,6 +166,7 @@ phonelink doctor       Check for common causes of lag and dropouts
 | `DIRECT` | `auto` | `off` always goes through the router |
 | `APP_ICONS` | `play` | `off` skips looking up app icons on Google Play |
 | `APP_DPI` | `200` | Size of the UI in app windows; higher is bigger |
+| `SOUND` | `pc` | Where a window's sound plays until you switch it: `pc` or `phone` |
 | `KEYBOARD` | `uhid` | `uhid` gives the phone a real keyboard, so its own keyboard app handles languages such as Chinese |
 | `SERIAL` | | Use this phone when several are connected |
 | `TAILSCALE` | `auto` | `off` never reaches the phone over Tailscale |
@@ -217,8 +274,9 @@ them from Tailscale to your Wi-Fi.
 network, the Wi-Fi card has to switch between the two, which slows both. Then
 phonelink uses the router instead.
 
-**Sound:** over Wi-Fi and Tailscale, phonelink buffers a little more audio, so
-short hiccups don't crackle.
+**Sound:** the phone's sound has its own connection, which reconnects and
+moves to a better path the same way the windows do. Over Wi-Fi and Tailscale it
+buffers a little more audio, so short hiccups don't crackle.
 
 **What phonelink can't fix:** Android's low-latency Wi-Fi mode needs a rooted
 phone. A connection that's simply too slow stays slow; `phonelink doctor`
@@ -244,8 +302,9 @@ What each window decided, and why, is logged in
   run `phonelink connect <port>` with the port the phone shows.
 - **A black window.** Some apps, such as banking apps and Netflix, block screen
   capture.
-- **Sound plays in only one window.** That's deliberate: only the first phone
-  window forwards sound, so it doesn't play twice.
+- **No sound on this computer.** Check the window's sound button in the bar
+  panel. Sound needs Android 11 or newer. If it still fails, the error is in
+  `~/.local/state/phonelink/logs/phonelink-sound.log`.
 - **Android emulators.** phonelink ignores them. To use one anyway, set
   `SERIAL` to its name, such as `emulator-5554`.
 - **Disconnect and Android Studio.** Disconnecting normally stops adb, because

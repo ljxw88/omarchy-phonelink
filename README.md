@@ -40,8 +40,10 @@ Samsung: if debugging is greyed out or the mouse doesn't work, turn off
 |---|---|
 | Open a phone app in its own window | **Super + Alt + P** |
 | Mirror the whole phone | **Super + Alt + Shift + P** |
+| Play a window's sound on the computer or the phone | **Super + Alt + V** in that window |
 | See your phone, recent apps, connection | Click the **phone icon** in the bar |
 | Go back / home on the phone | Right-click / middle-click in a phone window |
+| See how the computer reaches the phone | Bar icon › **Network map** |
 | Find out why it's laggy | **Omarchy menu › Phone › Check connection** |
 | Disconnect | Bar icon › **Disconnect** |
 

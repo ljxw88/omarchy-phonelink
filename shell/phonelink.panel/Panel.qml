@@ -15,6 +15,8 @@ Panel {
   id: root
   moduleName: "phonelink.panel"
   ipcTarget: "phonelink.panel"
+  // This panel owns its IPC target, for the extra `network` call.
+  manageIpc: false
 
   implicitWidth: button.implicitWidth
   implicitHeight: button.implicitHeight
@@ -33,6 +35,24 @@ Panel {
   property string via: "none"
   property bool relayed: false
   property bool reconnecting: false
+  // Where the phone's sound plays now, and the mirror's own setting. Each app
+  // carries its setting in `apps`.
+  property string sound: "phone"
+  property string mirrorSound: "pc"
+
+  // Sound switches clicked here wait in `soundQueue` and run one at a time, in
+  // order. Until a status check that started after the last of them comes
+  // back, the buttons show what was clicked (`expectedPrefs` per window,
+  // `expectedNow` for where the sound plays), so an older status reply can't
+  // flip a button back and make the next click send the opposite.
+  property var soundQueue: []
+  property var expectedPrefs: ({})
+  property string expectedNow: ""
+  property real soundDoneAt: 0
+  property real statusStartedAt: 0
+  property bool refreshQueued: false
+  property bool queuedBrief: true
+  readonly property string effectiveSound: expectedNow !== "" ? expectedNow : sound
   property string deviceName: ""
   property bool directUp: false
   property bool directSupported: false
@@ -62,6 +82,7 @@ Panel {
 
   readonly property string statusLabel: !loaded ? strings.t("checking")
     : reconnecting ? strings.t("reconnecting")
+    : connected && effectiveSound === "pc" ? strings.t("statusSoundHere").arg(viaLabel)
     : viaLabel
 
   readonly property string tooltip: connected || reconnecting
@@ -75,6 +96,7 @@ Panel {
     for (var i = 0; i < apps.length; i++) list.push({ kind: "app", group: 1, app: apps[i] })
     list.push({ kind: "all", group: 1 })
     // The direct link needs the phone nearby, so it's no use over Tailscale.
+    list.push({ kind: "network", group: 2 })
     if (directSupported && via !== "tailscale") list.push({ kind: "direct", group: 2 })
     if (connected) {
       list.push({ kind: "disconnect", group: 2 })
@@ -87,6 +109,11 @@ Panel {
 
   property int selectedIndex: 0
   property bool cursorActive: false
+
+  // The network map page, and the data it draws.
+  property bool networkOpen: false
+  property var network: null
+  property int laneIndex: -1
 
   readonly property color hoverFill: bar ? Style.hoverFillFor(bar.foreground, Commons.Color.accent) : "transparent"
   readonly property color selectedFill: bar ? Style.selectedFillFor(bar.foreground, Commons.Color.accent) : "transparent"
@@ -104,6 +131,10 @@ Panel {
       toggleDirect()
       return
     }
+    if (row.kind === "network") {
+      openNetwork()
+      return
+    }
     root.close()
     if (row.kind === "mirror") run(["mirror"])
     else if (row.kind === "app") run(["open", row.app.package])
@@ -111,6 +142,60 @@ Panel {
     else if (row.kind === "disconnect") run(["stop"])
     else if (row.kind === "connect") run(["connect"])
     else if (row.kind === "pair") run(["pair"])
+  }
+
+  // Phone windows share one sound, so an open window's row shows where it
+  // plays now. A row for a window that isn't open shows where it will play
+  // when that window opens. "pc", "phone", or "" for other rows.
+  function rowIsOpen(row) {
+    if (!row) return false
+    if (row.kind === "mirror") return mirrorOpen
+    if (row.kind === "app") return appOpen(row.app.package)
+    return false
+  }
+
+  function rowKey(row) {
+    return row.kind === "mirror" ? "mirror" : row.app.package
+  }
+
+  function soundOf(row) {
+    if (!row || (row.kind !== "mirror" && row.kind !== "app")) return ""
+    if (rowIsOpen(row)) return effectiveSound
+    var key = rowKey(row)
+    if (expectedPrefs[key] !== undefined) return expectedPrefs[key]
+    return row.kind === "mirror" ? mirrorSound : row.app.sound
+  }
+
+  function toggleSound(row) {
+    var current = soundOf(row)
+    if (current === "") return
+    var next = current === "pc" ? "phone" : "pc"
+    var key = rowKey(row)
+
+    var prefs = {}
+    for (var k in expectedPrefs) prefs[k] = expectedPrefs[k]
+    prefs[key] = next
+    expectedPrefs = prefs
+    if (rowIsOpen(row)) expectedNow = next
+
+    // Each switch names its result, so a later one for the same window
+    // replaces an earlier one still waiting.
+    var queue = soundQueue.filter(function(item) { return item.key !== key })
+    queue.push({ key: key, next: next })
+    soundQueue = queue
+    if (!soundProcess.running) runNextSound()
+  }
+
+  function runNextSound() {
+    if (soundQueue.length === 0) {
+      soundDoneAt = Date.now()
+      refresh(!opened)
+      return
+    }
+    var item = soundQueue[0]
+    soundQueue = soundQueue.slice(1)
+    soundProcess.command = [root.command, "sound", item.next, item.key]
+    soundProcess.running = true
   }
 
   function toggleDirect() {
@@ -145,6 +230,155 @@ Panel {
     directBusy = busy
   }
 
+  // The monitor this copy of the widget is on.
+  readonly property string screenName: {
+    var window = button.QsWindow.window
+    return window && window.screen ? String(window.screen.name) : ""
+  }
+
+  function openNetworkHere() {
+    root.open()
+    root.openNetwork()
+  }
+
+  function openNetwork() {
+    networkOpen = true
+    laneIndex = -1
+    refreshNetwork()
+  }
+
+  function closeNetwork() {
+    networkOpen = false
+    laneIndex = -1
+  }
+
+  function moveLane(dy) {
+    var count = network && network.paths ? network.paths.length : 0
+    if (count === 0) return
+    laneIndex = laneIndex < 0 ? (dy > 0 ? 0 : count - 1) : Math.max(0, Math.min(count - 1, laneIndex + dy))
+  }
+
+  function refreshNetwork() {
+    if (networkProcess.running) return
+    networkProcess.running = true
+  }
+
+  // Everything here came from the computer and the phone, so it's checked,
+  // bounded, and shown as plain text.
+  function clean(value, max) {
+    return typeof value === "string" ? value.slice(0, max || 64) : ""
+  }
+  function number(value) {
+    return typeof value === "number" && isFinite(value) ? value : null
+  }
+
+  function parseNetwork(text) {
+    var data
+    try {
+      data = JSON.parse(text)
+    } catch (e) {
+      return
+    }
+    if (!data || typeof data !== "object" || !Array.isArray(data.paths)) return
+
+    var kinds = ["usb", "direct", "wifi", "tailscale"]
+    var states = ["active", "connected", "available", "off", "unsupported"]
+    var paths = []
+    for (var i = 0; i < data.paths.length && paths.length < 4; i++) {
+      var p = data.paths[i] || {}
+      if (kinds.indexOf(p.kind) < 0) continue
+      var link = p.link && typeof p.link === "object"
+        ? { rttMs: number(p.link.rttMs) || 0, queueMs: number(p.link.queueMs) || 0, mbps: number(p.link.mbps) }
+        : null
+      var peer = p.peer && typeof p.peer === "object"
+        ? { online: p.peer.online === true ? true : p.peer.online === false ? false : null,
+            active: !!p.peer.active, direct: clean(p.peer.direct, 64) || null, relay: clean(p.peer.relay, 16) || null }
+        : null
+      paths.push({
+        kind: p.kind,
+        state: states.indexOf(p.state) >= 0 ? p.state : "off",
+        phone: clean(p.phone, 72),
+        computer: clean(p.computer, 40),
+        found: clean(p.found, 20),
+        otherChannel: p.otherChannel === true,
+        link: link,
+        peer: peer
+      })
+    }
+
+    var streams = []
+    var windows = Array.isArray(data.windows) ? data.windows : []
+    for (var j = 0; j < windows.length && streams.length < 8; j++) {
+      var w = windows[j] || {}
+      streams.push({
+        title: clean(w.title, 48),
+        path: kinds.indexOf(w.path) >= 0 ? w.path : "wifi",
+        sound: w.sound === true,
+        bitRate: clean(w.bitRate, 8),
+        codec: clean(w.codec, 8)
+      })
+    }
+
+    var c = data.computer || {}
+    var ph = data.phone && typeof data.phone === "object" ? data.phone : null
+    var router = data.router && typeof data.router === "object" ? data.router : null
+    network = {
+      computer: { name: clean(c.name, 48), ssid: clean(c.ssid, 48) },
+      phone: ph ? { name: clean(ph.name, 48), ssid: clean(ph.ssid, 48), mobile: clean(ph.mobile, 20) } : null,
+      router: router ? { ip: clean(router.ip, 20), sameAccessPoint: router.sameAccessPoint === false ? false : router.sameAccessPoint === true ? true : null } : null,
+      port: { found: clean(data.port && data.port.found, 16) },
+      paths: paths,
+      windows: streams
+    }
+  }
+
+  property string _networkText: ""
+
+  Process {
+    id: networkProcess
+    running: false
+    command: [root.command, "network", "--json"]
+    stdout: StdioCollector {
+      id: networkOut
+      waitForEnd: true
+      onStreamFinished: root._networkText = text
+    }
+    onExited: function(exitCode) {
+      if (exitCode === 0) root.parseNetwork(String(networkOut.text || root._networkText || ""))
+    }
+  }
+
+  // The map updates every 2 seconds, but only while it's open.
+  Timer {
+    interval: 2000
+    repeat: true
+    running: root.opened && root.networkOpen
+    onTriggered: root.refreshNetwork()
+  }
+
+  ShellIpc {
+    target: "phonelink.panel"
+
+    function open(): void { root.open() }
+    function close(): void { root.close() }
+    function show(): void { root.open() }
+    function hide(): void { root.close() }
+    function toggle(): void { root.toggle() }
+    // Opens on the monitor in focus. One copy of the widget handles the
+    // call for all of them, so it hands it to the right one.
+    function network(): void {
+      var focused = Hyprland.focusedMonitor ? String(Hyprland.focusedMonitor.name) : ""
+      var items = root.copies()
+      for (var i = 0; i < items.length; i++) {
+        if (items[i] && items[i].screenName === focused && typeof items[i].openNetworkHere === "function") {
+          items[i].openNetworkHere()
+          return
+        }
+      }
+      root.openNetworkHere()
+    }
+  }
+
   function moveCursor(dy) {
     if (!cursorActive) {
       cursorActive = true
@@ -154,7 +388,10 @@ Panel {
   }
 
   onOpenedChanged: {
-    if (!opened) return
+    if (!opened) {
+      closeNetwork()
+      return
+    }
     cursorActive = false
     selectedIndex = 0
     refresh(false)
@@ -164,8 +401,15 @@ Panel {
 
   // --- status ----------------------------------------------------------------
 
+  // A check asked for while one runs follows it rather than being dropped,
+  // so the state after a change is always read after the change.
   function refresh(brief) {
-    if (statusProcess.running) return
+    if (statusProcess.running) {
+      queuedBrief = refreshQueued ? (queuedBrief && brief) : brief
+      refreshQueued = true
+      return
+    }
+    statusStartedAt = Date.now()
     statusProcess.command = brief
       ? [root.command, "status", "--json", "--brief"]
       : [root.command, "status", "--json"]
@@ -194,7 +438,8 @@ Panel {
         package: pkg,
         name: String(app.name || pkg).slice(0, 60),
         icon: /^\/[^\n]+\.png$/.test(icon) ? icon : "",
-        pinned: !!app.pinned
+        pinned: !!app.pinned,
+        sound: app.sound === "phone" ? "phone" : "pc"
       })
     }
 
@@ -206,7 +451,10 @@ Panel {
       name: typeof data.name === "string" ? data.name.slice(0, 80) : "",
       direct: !!data.direct,
       directSupported: !!data.directSupported,
-      apps: list
+      apps: list,
+      sound: data.sound === "pc" ? "pc" : "phone",
+      mirrorSound: data.mirrorSound === "phone" ? "phone" : "pc",
+      startedAt: statusStartedAt
     }
     var items = copies()
     for (var j = 0; j < items.length; j++)
@@ -222,7 +470,16 @@ Panel {
     directUp = status.direct
     directSupported = status.directSupported
     apps = status.apps
+    sound = status.sound
+    mirrorSound = status.mirrorSound
     loaded = true
+
+    // The switches clicked here are done and this check began after them, so
+    // it shows their result: stop showing the clicks and show the state.
+    if (soundQueue.length === 0 && !soundProcess.running && soundDoneAt > 0 && status.startedAt >= soundDoneAt) {
+      expectedPrefs = ({})
+      expectedNow = ""
+    }
   }
 
   property string _statusText: ""
@@ -238,7 +495,19 @@ Panel {
     }
     onExited: function(exitCode) {
       if (exitCode === 0) root.parseStatus(String(statusOut.text || root._statusText || ""))
+      if (root.refreshQueued) {
+        var brief = root.queuedBrief
+        root.refreshQueued = false
+        Qt.callLater(function() { root.refresh(brief) })
+      }
     }
+  }
+
+  Process {
+    id: soundProcess
+    running: false
+    command: []
+    onExited: Qt.callLater(root.runNextSound)
   }
 
   Process {
@@ -294,17 +563,28 @@ Panel {
     bar: root.bar
     open: root.opened
     focusTarget: panel.loadedContent
-    contentWidth: panel.fittedContentWidth(Style.space(340))
+    contentWidth: panel.fittedContentWidth(Style.space(root.networkOpen ? 470 : 340))
     contentHeight: panel.fittedContentHeight(panel.loadedContentHeight)
 
     content: PanelKeyCatcher {
       implicitHeight: column.implicitHeight
       anchors.fill: parent
-      onMoveRequested: function(dx, dy) { if (dy !== 0) root.moveCursor(dy) }
-      onActivateRequested: if (root.cursorActive) root.activate(root.rows[root.selectedIndex])
-      onCloseRequested: root.close()
+      onMoveRequested: function(dx, dy) {
+        if (root.networkOpen) {
+          if (dx < 0) root.closeNetwork()
+          else if (dy !== 0) root.moveLane(dy)
+        } else if (dy !== 0) {
+          root.moveCursor(dy)
+        }
+      }
+      onActivateRequested: if (!root.networkOpen && root.cursorActive) root.activate(root.rows[root.selectedIndex])
+      onCloseRequested: root.networkOpen ? root.closeNetwork() : root.close()
       onTabRequested: function(direction) { root.switchPanel(direction) }
-      onTextKey: function(t) { if (t === "m" || t === "M") root.activate({ kind: "mirror" }) }
+      onTextKey: function(t) {
+        if (t === "m" || t === "M") root.activate({ kind: "mirror" })
+        else if ((t === "s" || t === "S") && root.cursorActive) root.toggleSound(root.rows[root.selectedIndex])
+        else if (t === "n" || t === "N") root.networkOpen ? root.closeNetwork() : root.openNetwork()
+      }
 
       Column {
         id: column
@@ -339,7 +619,7 @@ Panel {
 
             Text {
               textFormat: Text.PlainText
-              text: root.deviceName || strings.t("phone")
+              text: root.networkOpen ? strings.t("networkMap") : (root.deviceName || strings.t("phone"))
               color: root.bar.foreground
               font.family: root.bar.fontFamily
               font.pixelSize: Style.font.title
@@ -365,18 +645,35 @@ Panel {
             id: moreButton
             anchors.right: parent.right
             anchors.verticalCenter: parent.verticalCenter
-            iconText: "󰒓"
-            tooltipText: strings.t("moreOptions")
+            iconText: root.networkOpen ? "󰁍" : "󰒓"
+            tooltipText: root.networkOpen ? strings.t("back") : strings.t("moreOptions")
             foreground: root.bar.foreground
             fontFamily: root.bar.fontFamily
             onClicked: {
+              if (root.networkOpen) {
+                root.closeNetwork()
+                return
+              }
               root.close()
               Quickshell.execDetached(["omarchy-menu", "summon", "phone"])
             }
           }
         }
 
+        NetworkView {
+          visible: root.networkOpen
+          width: parent.width
+          network: root.network
+          catalog: strings
+          foreground: root.bar.foreground
+          accent: Commons.Color.accent
+          fontFamily: root.bar.fontFamily
+          laneIndex: root.laneIndex
+          onLaneHovered: function(index) { root.laneIndex = index }
+        }
+
         Column {
+          visible: !root.networkOpen
           width: parent.width
           spacing: Style.space(10)
 
@@ -436,9 +733,12 @@ Panel {
       : kind === "direct" ? "󰖩"
       : kind === "disconnect" ? "󰅙"
       : kind === "connect" ? "󰌘"
+      : kind === "network" ? "󰛳"
       : "󰐲"
 
     readonly property string iconPath: kind === "app" ? rowData.app.icon : ""
+    readonly property string soundSetting: root.soundOf(rowData)
+    readonly property bool windowOpen: root.rowIsOpen(rowData)
 
     readonly property string title: kind === "mirror" ? strings.t("mirror")
       : kind === "app" ? rowData.app.name
@@ -446,6 +746,7 @@ Panel {
       : kind === "direct" ? strings.t("direct")
       : kind === "disconnect" ? strings.t("disconnect")
       : kind === "connect" ? strings.t("connect")
+      : kind === "network" ? strings.t("networkMap")
       : strings.t("pair")
 
     readonly property string caption: {
@@ -455,6 +756,7 @@ Panel {
       if (kind === "direct") return root.directBusy ? strings.t("directBusy") : (root.directUp ? strings.t("directOn") : strings.t("directOff"))
       if (kind === "disconnect") return strings.t("disconnectCaption")
       if (kind === "connect") return strings.t("connectCaption")
+      if (kind === "network") return strings.t("networkMapCaption")
       return strings.t("pairCaption")
     }
 
@@ -483,7 +785,7 @@ Panel {
       anchors.verticalCenter: parent.verticalCenter
       anchors.leftMargin: Style.space(10)
       anchors.rightMargin: Style.space(10)
-      implicitHeight: Math.max(iconBox.height, labels.implicitHeight, toggle.visible ? toggle.implicitHeight : 0)
+      implicitHeight: Math.max(iconBox.height, labels.implicitHeight, trailing.implicitHeight)
 
       Item {
         id: iconBox
@@ -514,8 +816,8 @@ Panel {
         id: labels
         anchors.left: iconBox.right
         anchors.leftMargin: Style.space(10)
-        anchors.right: toggle.visible ? toggle.left : parent.right
-        anchors.rightMargin: toggle.visible ? Style.space(10) : 0
+        anchors.right: trailing.width > 0 ? trailing.left : parent.right
+        anchors.rightMargin: trailing.width > 0 ? Style.space(10) : 0
         anchors.verticalCenter: parent.verticalCenter
         spacing: Style.space(1)
 
@@ -541,15 +843,39 @@ Panel {
         }
       }
 
-      ToggleSwitch {
-        id: toggle
-        visible: row.kind === "direct"
-        interactive: false
-        checked: root.directUp
-        busy: root.directBusy
-        foreground: root.bar.foreground
+      // The Direct Wi-Fi switch, or a mirror or app's sound button.
+      Item {
+        id: trailing
         anchors.right: parent.right
         anchors.verticalCenter: parent.verticalCenter
+        width: toggle.visible ? toggle.implicitWidth : soundButton.visible ? soundButton.implicitWidth : 0
+        implicitHeight: toggle.visible ? toggle.implicitHeight : soundButton.visible ? soundButton.implicitHeight : 0
+        height: implicitHeight
+
+        ToggleSwitch {
+          id: toggle
+          visible: row.kind === "direct"
+          interactive: false
+          checked: root.directUp
+          busy: root.directBusy
+          foreground: root.bar.foreground
+          anchors.right: parent.right
+          anchors.verticalCenter: parent.verticalCenter
+        }
+
+        PanelActionButton {
+          id: soundButton
+          visible: row.soundSetting !== ""
+          anchors.right: parent.right
+          anchors.verticalCenter: parent.verticalCenter
+          iconText: row.soundSetting === "pc" ? "󰽟" : "󰥒"
+          tooltipText: row.windowOpen
+            ? (row.soundSetting === "pc" ? strings.t("soundPcTip") : strings.t("soundPhoneTip"))
+            : (row.soundSetting === "pc" ? strings.t("soundPcNextTip") : strings.t("soundPhoneNextTip"))
+          foreground: root.bar.foreground
+          fontFamily: root.bar.fontFamily
+          onClicked: root.toggleSound(row.rowData)
+        }
       }
     }
   }
