@@ -26,5 +26,8 @@
   "connect": "Connect",
   "connectCaption": "Find your phone nearby or over Tailscale",
   "pair": "Pair a new phone",
-  "pairCaption": "Over Wi-Fi with a QR code"
+  "pairCaption": "Over Wi-Fi with a QR code",
+  "statusSoundHere": "%1 · sound here",
+  "soundPcTip": "Sound plays on this computer. Click to play it on the phone (S)",
+  "soundPhoneTip": "Sound plays on the phone. Click to play it on this computer (S)"
 }

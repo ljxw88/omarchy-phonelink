@@ -32,6 +32,10 @@ Panel {
   property bool connected: false
   property string via: "none"
   property bool relayed: false
+  // Where the phone's sound plays now, and the mirror's own setting. Each app
+  // carries its setting in `apps`.
+  property string sound: "phone"
+  property string mirrorSound: "pc"
   property string deviceName: ""
   property bool directUp: false
   property bool directSupported: false
@@ -59,7 +63,9 @@ Panel {
     : via === "tailscale" ? (relayed ? strings.t("viaTailscaleRelayed") : strings.t("viaTailscale"))
     : strings.t("notConnected")
 
-  readonly property string statusLabel: !loaded ? strings.t("checking") : viaLabel
+  readonly property string statusLabel: !loaded ? strings.t("checking")
+    : connected && sound === "pc" ? strings.t("statusSoundHere").arg(viaLabel)
+    : viaLabel
 
   readonly property string tooltip: connected
     ? strings.t("tooltipConnected").arg(deviceName || strings.t("phone")).arg(viaLabel)
@@ -108,6 +114,37 @@ Panel {
     else if (row.kind === "disconnect") run(["stop"])
     else if (row.kind === "connect") run(["connect"])
     else if (row.kind === "pair") run(["pair"])
+  }
+
+  // The sound setting of a mirror or app row: "pc" or "phone".
+  function soundOf(row) {
+    if (!row) return ""
+    if (row.kind === "mirror") return mirrorSound
+    if (row.kind === "app") return row.app.sound
+    return ""
+  }
+
+  // Shows the new setting at once, then lets phonelink apply it.
+  function toggleSound(row) {
+    var current = soundOf(row)
+    if (current === "") return
+    var next = current === "pc" ? "phone" : "pc"
+    var key = row.kind === "mirror" ? "mirror" : row.app.package
+    if (row.kind === "mirror") {
+      mirrorSound = next
+    } else {
+      var list = apps.slice()
+      for (var i = 0; i < list.length; i++) {
+        if (list[i].package !== key) continue
+        var copy = {}
+        for (var k in list[i]) copy[k] = list[i][k]
+        copy.sound = next
+        list[i] = copy
+      }
+      apps = list
+    }
+    soundProcess.command = [root.command, "sound", next, key]
+    soundProcess.running = true
   }
 
   function toggleDirect() {
@@ -191,7 +228,8 @@ Panel {
         package: pkg,
         name: String(app.name || pkg).slice(0, 60),
         icon: /^\/[^\n]+\.png$/.test(icon) ? icon : "",
-        pinned: !!app.pinned
+        pinned: !!app.pinned,
+        sound: app.sound === "phone" ? "phone" : "pc"
       })
     }
 
@@ -202,7 +240,9 @@ Panel {
       name: typeof data.name === "string" ? data.name.slice(0, 80) : "",
       direct: !!data.direct,
       directSupported: !!data.directSupported,
-      apps: list
+      apps: list,
+      sound: data.sound === "pc" ? "pc" : "phone",
+      mirrorSound: data.mirrorSound === "phone" ? "phone" : "pc"
     }
     var items = copies()
     for (var j = 0; j < items.length; j++)
@@ -217,6 +257,8 @@ Panel {
     directUp = status.direct
     directSupported = status.directSupported
     apps = status.apps
+    sound = status.sound
+    mirrorSound = status.mirrorSound
     loaded = true
   }
 
@@ -234,6 +276,13 @@ Panel {
     onExited: function(exitCode) {
       if (exitCode === 0) root.parseStatus(String(statusOut.text || root._statusText || ""))
     }
+  }
+
+  Process {
+    id: soundProcess
+    running: false
+    command: []
+    onExited: root.refresh(!root.opened)
   }
 
   Process {
@@ -299,7 +348,10 @@ Panel {
       onActivateRequested: if (root.cursorActive) root.activate(root.rows[root.selectedIndex])
       onCloseRequested: root.close()
       onTabRequested: function(direction) { root.switchPanel(direction) }
-      onTextKey: function(t) { if (t === "m" || t === "M") root.activate({ kind: "mirror" }) }
+      onTextKey: function(t) {
+        if (t === "m" || t === "M") root.activate({ kind: "mirror" })
+        else if ((t === "s" || t === "S") && root.cursorActive) root.toggleSound(root.rows[root.selectedIndex])
+      }
 
       Column {
         id: column
@@ -434,6 +486,7 @@ Panel {
       : "󰐲"
 
     readonly property string iconPath: kind === "app" ? rowData.app.icon : ""
+    readonly property string soundSetting: root.soundOf(rowData)
 
     readonly property string title: kind === "mirror" ? strings.t("mirror")
       : kind === "app" ? rowData.app.name
@@ -478,7 +531,7 @@ Panel {
       anchors.verticalCenter: parent.verticalCenter
       anchors.leftMargin: Style.space(10)
       anchors.rightMargin: Style.space(10)
-      implicitHeight: Math.max(iconBox.height, labels.implicitHeight, toggle.visible ? toggle.implicitHeight : 0)
+      implicitHeight: Math.max(iconBox.height, labels.implicitHeight, trailing.implicitHeight)
 
       Item {
         id: iconBox
@@ -509,8 +562,8 @@ Panel {
         id: labels
         anchors.left: iconBox.right
         anchors.leftMargin: Style.space(10)
-        anchors.right: toggle.visible ? toggle.left : parent.right
-        anchors.rightMargin: toggle.visible ? Style.space(10) : 0
+        anchors.right: trailing.width > 0 ? trailing.left : parent.right
+        anchors.rightMargin: trailing.width > 0 ? Style.space(10) : 0
         anchors.verticalCenter: parent.verticalCenter
         spacing: Style.space(1)
 
@@ -536,15 +589,37 @@ Panel {
         }
       }
 
-      ToggleSwitch {
-        id: toggle
-        visible: row.kind === "direct"
-        interactive: false
-        checked: root.directUp
-        busy: root.directBusy
-        foreground: root.bar.foreground
+      // The Direct Wi-Fi switch, or a mirror or app's sound button.
+      Item {
+        id: trailing
         anchors.right: parent.right
         anchors.verticalCenter: parent.verticalCenter
+        width: toggle.visible ? toggle.implicitWidth : soundButton.visible ? soundButton.implicitWidth : 0
+        implicitHeight: toggle.visible ? toggle.implicitHeight : soundButton.visible ? soundButton.implicitHeight : 0
+        height: implicitHeight
+
+        ToggleSwitch {
+          id: toggle
+          visible: row.kind === "direct"
+          interactive: false
+          checked: root.directUp
+          busy: root.directBusy
+          foreground: root.bar.foreground
+          anchors.right: parent.right
+          anchors.verticalCenter: parent.verticalCenter
+        }
+
+        PanelActionButton {
+          id: soundButton
+          visible: row.soundSetting !== ""
+          anchors.right: parent.right
+          anchors.verticalCenter: parent.verticalCenter
+          iconText: row.soundSetting === "pc" ? "󰽟" : "󰥒"
+          tooltipText: row.soundSetting === "pc" ? strings.t("soundPcTip") : strings.t("soundPhoneTip")
+          foreground: root.bar.foreground
+          fontFamily: root.bar.fontFamily
+          onClicked: root.toggleSound(row.rowData)
+        }
       }
     }
   }

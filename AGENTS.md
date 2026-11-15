@@ -62,7 +62,8 @@ On Samsung phones, if debugging is greyed out or mouse input is blocked, the use
 should turn off **Settings › Security and privacy › Auto Blocker**.
 
 Then tell them: **Super + Alt + P** opens a phone app, **Super + Alt + Shift + P**
-mirrors the phone, and the phone icon in the bar has everything else.
+mirrors the phone, **Super + Alt + V** switches a window's sound between the
+computer and the phone, and the phone icon in the bar has everything else.
 
 If the user wants to use the phone away from home, check that `tailscale status`
 lists the phone. Remote use then works by itself once the phone has connected

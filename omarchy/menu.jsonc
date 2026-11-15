@@ -2,6 +2,7 @@
   "phone": {"icon":"󰄜","label":"Phone","aliases":["phonelink","android"],"description":"Use your Android phone"},
   "phone.apps": {"icon":"󰀻","label":"Open phone app","action":"phonelink apps"},
   "phone.mirror": {"icon":"󰍹","label":"Mirror screen","action":"phonelink mirror"},
+  "phone.sound": {"icon":"󰽟","label":"Switch sound","description":"Play the phone window's sound on this computer or the phone","action":"phonelink sound toggle"},
   "phone.pin": {"icon":"󰐃","label":"Pin apps to launcher","action":"phonelink pin"},
   "phone.refresh": {"icon":"󰑐","label":"Refresh app list","action":"phonelink refresh"},
   "phone.stop": {"icon":"󰅙","label":"Disconnect","description":"Close phone windows and drop all connections","action":"phonelink stop"},

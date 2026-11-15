@@ -29,7 +29,7 @@ remove_config_lines() {
     sed -i -E \
       -e '/^ *\/\/ >>> phonelink >>>/,/^ *\/\/ <<< phonelink <<</d' \
       -e '/^ *\/\/ Android phone \(phonelink, built on scrcpy\)\.$/d' \
-      -e '/^ *"phone(\.(apps|mirror|pin|refresh|stop|wireless(\.(direct|connect|pair|usb|disconnect))?))?":/d' \
+      -e '/^ *"phone(\.(apps|mirror|sound|pin|refresh|stop|wireless(\.(direct|connect|pair|usb|disconnect))?))?":/d' \
       "$MENU_FILE"
 }
 

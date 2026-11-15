@@ -57,7 +57,7 @@ first_install=true
 grep -q 'require("hypr.phonelink")' "$HYPR_DIR/hyprland.lua" && first_install=false
 
 if $first_install; then
-  taken=$(omarchy menu keybindings --print 2>/dev/null | grep -E '^SUPER (SHIFT )?ALT \+ P\s' || true)
+  taken=$(omarchy menu keybindings --print 2>/dev/null | grep -E '^SUPER (SHIFT )?ALT \+ (P|V)\s' || true)
   if [[ -n $taken ]]; then
     note "These keys are already bound, and phonelink binds them too:"
     echo "$taken" | sed 's/^/    /'
@@ -107,7 +107,7 @@ fi
 sed -i -E \
   -e '/^ *\/\/ >>> phonelink >>>/,/^ *\/\/ <<< phonelink <<</d' \
   -e '/^ *\/\/ Android phone \(phonelink, built on scrcpy\)\.$/d' \
-  -e '/^ *"phone(\.(apps|mirror|pin|refresh|stop|wireless(\.(direct|connect|pair|usb|disconnect))?))?":/d' \
+  -e '/^ *"phone(\.(apps|mirror|sound|pin|refresh|stop|wireless(\.(direct|connect|pair|usb|disconnect))?))?":/d' \
   "$MENU_FILE"
 
 last=$(grep -n '^}' "$MENU_FILE" | tail -1 | cut -d: -f1 || true)

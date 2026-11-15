@@ -6,6 +6,7 @@
 - [What the installer changes](#what-the-installer-changes)
 - [The bar icon](#the-bar-icon)
 - [Inside a phone window](#inside-a-phone-window)
+- [Sound](#sound)
 - [Commands](#commands)
 - [Settings](#settings)
 - [The direct Wi-Fi link](#the-direct-wi-fi-link)
@@ -53,11 +54,12 @@ color while a phone window is open.
 
 - **Left click** opens a panel with:
   - the phone's name and how it's connected;
-  - Mirror, and your recent and pinned apps;
+  - Mirror, and your recent and pinned apps, each with a sound button;
   - the Direct Wi-Fi link switch;
   - Disconnect, or Connect and Pair when no phone is connected.
 
-  In the panel, arrow keys or j/k move, Enter opens and Esc closes.
+  In the panel, arrow keys or j/k move, Enter opens, S switches the sound and
+  Esc closes.
 - **Right click** mirrors the phone.
 - **Middle click** opens the full app list.
 
@@ -72,6 +74,7 @@ Move it by dragging it along the bar, or with
 | Home | **Super + H** or middle-click |
 | Notification panel | **Super + N** |
 | Rotate | **Super + R** |
+| Sound on this computer or the phone | **Super + Alt + V** |
 | Float the window | **Super + T** |
 
 Copy and paste work both ways. Drag a file onto a window to send it to the
@@ -80,6 +83,21 @@ phone, or drag an APK to install it.
 Each phone app runs on its own virtual display that resizes with its tile, so
 it lays itself out like a desktop app and leaves the phone's own screen free.
 The mirror keeps the phone's shape inside its tile.
+
+## Sound
+
+Each phone app and the mirror has its own sound setting: **on this computer**
+(the default) or **on the phone**. Switch it with **Super + Alt + V** in the
+window, or with the speaker button on its row in the bar panel. phonelink
+remembers the setting for that app.
+
+Android mixes every app's sound into one output, so the sound can't be split
+by app. phonelink plays the phone's sound on this computer while any open phone
+window is set to it. When none is, or the last phone window closes, the sound
+goes back to the phone.
+
+While it plays here, the phone's speaker is silent. The sound goes to this
+computer's current output, as set in Omarchy's audio panel.
 
 ## Commands
 
@@ -91,6 +109,8 @@ phonelink pin          Choose which phone apps appear in the app launcher
 phonelink pair         Pair over Wi-Fi with a QR code
 phonelink connect      Connect to a paired phone, nearby or over Tailscale
 phonelink connect <port>  Reach the phone over Tailscale at this Wireless debugging port
+phonelink sound [pc|phone|toggle] [mirror|<pkg>]
+                       Play a window's sound on this computer or the phone
 phonelink direct       Link straight to the phone with Wi-Fi Direct
 phonelink direct off   Drop the direct link
 phonelink wifi         Switch a USB-connected phone to Wi-Fi
@@ -108,6 +128,7 @@ phonelink status       Show connected phones
 | `DIRECT` | `auto` | `off` always goes through the router |
 | `APP_ICONS` | `play` | `off` skips looking up app icons on Google Play |
 | `APP_DPI` | `200` | Size of the UI in app windows; higher is bigger |
+| `SOUND` | `pc` | Where a window's sound plays until you switch it: `pc` or `phone` |
 | `KEYBOARD` | `uhid` | `uhid` gives the phone a real keyboard, so its own keyboard app handles languages such as Chinese |
 | `SERIAL` | | Use this phone when several are connected |
 | `TAILSCALE` | `auto` | `off` never reaches the phone over Tailscale |
@@ -178,8 +199,9 @@ and relays traffic through its servers, phonelink warns you, and the bar shows
   run `phonelink connect <port>` with the port the phone shows.
 - **A black window.** Some apps, such as banking apps and Netflix, block screen
   capture.
-- **Sound plays in only one window.** That's deliberate: only the first phone
-  window forwards sound, so it doesn't play twice.
+- **No sound on this computer.** Check the window's sound button in the bar
+  panel. Sound needs Android 11 or newer. If it still fails, the error is in
+  `~/.local/state/phonelink/logs/phonelink-sound.log`.
 - **Android emulators.** phonelink ignores them. To use one anyway, set
   `SERIAL` to its name, such as `emulator-5554`.
 - **Disconnect and Android Studio.** Disconnecting normally stops adb, because

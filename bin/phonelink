@@ -10,6 +10,8 @@
 #   phonelink pair         Pair over Wi-Fi with a QR code (Android 11+)
 #   phonelink connect      Connect to a paired phone, nearby or over Tailscale
 #   phonelink connect <port>  Reach the phone over Tailscale at this Wireless debugging port
+#   phonelink sound [pc|phone|toggle] [mirror|<pkg>]
+#                          Play a phone window's sound on this computer or the phone
 #   phonelink direct       Link straight to the phone with Wi-Fi Direct (faster)
 #   phonelink direct off   Drop the direct link
 #   phonelink wifi         Switch a USB-connected phone to Wi-Fi
@@ -53,6 +55,7 @@ DIRECT="auto"                      # auto = use a Wi-Fi Direct link when on Wi-F
 APP_ICONS="play"                   # play = app icons from Google Play (sends it the app's package name), off = a generic icon
 KEYBOARD="uhid"                    # uhid = real keyboard on the phone, sdk = injected text
 APP_DPI=200                        # app window density; higher makes the app UI bigger
+SOUND="pc"                         # where a phone window's sound plays until you switch it: pc or phone
 APP_ARGS=(--no-vd-system-decorations --keep-active)
 MIRROR_ARGS=(--max-size=1600)
 COMMON_ARGS=(--video-bit-rate=10M)
@@ -104,13 +107,15 @@ focus_class() {
     hyprctl dispatch focuswindow "address:$address" &>/dev/null
 }
 
-# Only one scrcpy window should forward the phone's sound, or it plays twice.
-audio_busy() {
-  local pid
+# Prints "pid<TAB>id" for every scrcpy phonelink started: the mirror
+# ("phonelink"), app windows ("phonelink.<package>") and the sound connection.
+phonelink_processes() {
+  local pid id
   for pid in $(pgrep -x scrcpy); do
-    tr '\0' '\n' <"/proc/$pid/cmdline" 2>/dev/null | grep -qx -- '--no-audio' || return 0
+    id=$(tr '\0' '\n' <"/proc/$pid/environ" 2>/dev/null | sed -n 's/^SDL_APP_ID=//p')
+    [[ $id == phonelink* ]] && printf '%s\t%s\n' "$pid" "$id"
   done
-  return 1
+  return 0
 }
 
 # The current Omarchy theme's background, so bars around the phone picture
@@ -710,6 +715,163 @@ is_pinned() {
   grep -qx 'NoDisplay=false' "$DESKTOP_DIR/phonelink.$1.desktop" 2>/dev/null
 }
 
+# ---------------------------------------------------------------- sound
+
+# Android mixes every app's sound into one output, so a phone window can't
+# carry just its own. One hidden, sound-only connection carries the phone's
+# sound for all windows instead, and the windows carry none. It runs while any
+# open phone window is set to play its sound here ("pc"), and stops when none
+# is, which hands the sound back to the phone. Each window's setting is
+# remembered, under "mirror" or the app's package name.
+SOUND_ID="phonelink-sound"
+SOUND_PREFS="$STATE_DIR/sound"
+STOPPING_FILE="$STATE_DIR/stopping"
+
+# The setting key for a phonelink window id or class, if it is one.
+window_key() {
+  case $1 in
+  phonelink) echo mirror ;;
+  phonelink.*) echo "${1#phonelink.}" ;;
+  esac
+}
+
+open_window_keys() {
+  local id
+  while IFS=$'\t' read -r _ id; do
+    window_key "$id"
+  done < <(phonelink_processes)
+}
+
+sound_pref() {
+  local pref
+  pref=$(awk -v k="$1" '$1 == k { print $2; exit }' "$SOUND_PREFS" 2>/dev/null)
+  [[ $pref == pc || $pref == phone ]] || pref=$SOUND
+  [[ $pref == phone ]] && echo phone || echo pc
+}
+
+set_sound_pref() {
+  local tmp
+  tmp=$(mktemp)
+  { awk -v k="$1" '$1 != k' "$SOUND_PREFS" 2>/dev/null; echo "$1 $2"; } >"$tmp"
+  mv "$tmp" "$SOUND_PREFS"
+}
+
+sound_pid() {
+  phonelink_processes | awk -F'\t' -v id="$SOUND_ID" '$2 == id { print $1; exit }'
+}
+
+# The device a running scrcpy was started for.
+process_serial() {
+  tr '\0' '\n' <"/proc/$1/cmdline" 2>/dev/null | awk 'prev == "-s" { print; exit } { prev = $0 }'
+}
+
+sound_stop() {
+  local pid _
+  pid=$(sound_pid)
+  [[ -n $pid ]] || return 0
+  if [[ -n ${PHONELINK_DRY_RUN:-} ]]; then
+    echo "sound: stop"
+    return
+  fi
+  kill "$pid" 2>/dev/null
+  # Two sound connections at once would fight over the phone's audio.
+  for _ in {1..20}; do
+    kill -0 "$pid" 2>/dev/null || return 0
+    sleep 0.1
+  done
+}
+
+sound_start() {
+  local serial=$1 pid args
+  pid=$(sound_pid)
+  if [[ -n $pid ]]; then
+    [[ $(process_serial "$pid") == "$serial" ]] && return 0
+    sound_stop
+  fi
+  args=(-s "$serial" --no-video --no-control --no-window --require-audio)
+  # Tailscale paths jitter more, and a bigger buffer keeps sound from crackling.
+  is_tailnet_serial "$serial" && args+=(--audio-buffer=150)
+  spawn "$SOUND_ID" "Phone sound" "${args[@]}"
+}
+
+# Puts the phone's sound where the open windows want it. $1 names a window
+# that's starting and may not be running yet, $2 the device it uses.
+sound_apply() {
+  local starting=${1:-} serial=${2:-} key want=phone pid
+  # While phonelink stop closes the windows, the ones closing mustn't start
+  # the sound again. Opening a window ends that.
+  if [[ -n $starting ]]; then
+    rm -f "$STOPPING_FILE"
+  elif [[ -n $(find "$STOPPING_FILE" -newermt '-20 seconds' 2>/dev/null) ]]; then
+    return 0
+  fi
+  while read -r key; do
+    [[ -n $key && $(sound_pref "$key") == pc ]] && want=pc
+  done < <(open_window_keys; [[ -n $starting ]] && echo "$starting")
+
+  if [[ $want == phone ]]; then
+    sound_stop
+    return
+  fi
+  if [[ -z $serial ]]; then
+    [[ -n $(sound_pid) ]] && return 0
+    pid=$(phonelink_processes | awk -F'\t' -v id="$SOUND_ID" '$2 != id { print $1; exit }')
+    [[ -n $pid ]] && serial=$(process_serial "$pid")
+  fi
+  [[ -n $serial ]] && sound_start "$serial"
+  return 0
+}
+
+sound_label() {
+  [[ $1 == mirror ]] && echo "Mirror" || app_name "$1"
+}
+
+# phonelink sound [pc|phone|toggle] [mirror|<package>]
+# Without a window named, it's the focused phone window, or else every open one.
+sound_cmd() {
+  local mode=${1:-toggle} key=${2:-} keys=() k new others
+  [[ $mode =~ ^(pc|phone|toggle)$ ]] || die "Usage: phonelink sound [pc|phone|toggle] [mirror|<package>]"
+
+  if [[ -z $key ]]; then
+    key=$(window_key "$(hyprctl activewindow -j 2>/dev/null | jq -r '.class // empty')")
+  fi
+  if [[ -n $key ]]; then
+    [[ $key == mirror ]] || valid_pkg "$key" || die "Not a phone window: $key"
+    keys=("$key")
+  else
+    mapfile -t keys < <(open_window_keys | sort -u)
+    ((${#keys[@]})) || die "Open a phone app or the mirror first, then switch its sound."
+  fi
+
+  new=$mode
+  if [[ $mode == toggle ]]; then
+    if ((${#keys[@]} == 1)); then
+      [[ $(sound_pref "${keys[0]}") == pc ]] && new=phone || new=pc
+    else
+      [[ -n $(sound_pid) ]] && new=phone || new=pc
+    fi
+  fi
+  for k in "${keys[@]}"; do
+    set_sound_pref "$k" "$new"
+  done
+  sound_apply
+
+  if ((${#keys[@]} > 1)); then
+    [[ $new == pc ]] && notify "Phone sound" "Playing on this computer." || notify "Phone sound" "Playing on the phone."
+  elif [[ $new == pc ]]; then
+    notify "$(sound_label "$key")" "Sound plays on this computer."
+  else
+    others=$(open_window_keys | sort -u | while read -r k; do
+      [[ $k != "$key" && $(sound_pref "$k") == pc ]] && sound_label "$k"
+    done | paste -sd, - | sed 's/,/, /g')
+    if [[ -n $others ]]; then
+      notify "$(sound_label "$key")" "Set to the phone. The sound stays here while $others is set to play on this computer."
+    else
+      notify "$(sound_label "$key")" "Sound plays on the phone."
+    fi
+  fi
+}
+
 # ---------------------------------------------------------------- launching
 
 # Runs scrcpy detached from whatever launched us, and reports failures.
@@ -763,6 +925,16 @@ run_scrcpy() {
   SDL_APP_ID="$app_id" scrcpy "$@" >"$log" 2>&1
   code=$?
 
+  if [[ $app_id == "$SOUND_ID" ]]; then
+    # Stopped by phonelink (128+), or the phone went away, which its windows report.
+    if ((code != 0 && code != 2 && code < 128)); then
+      error=$(grep -E "ERROR:" "$log" | tail -1 | sed 's/.*ERROR: *//')
+      notify -u normal "Phone sound stays on the phone" "${error:-It could not be played here. See $log}"
+    fi
+    return
+  fi
+  sound_apply
+
   if grep -q "INJECT_EVENTS" "$log"; then
     notify -u normal "$label" "The phone blocked mouse and keyboard input. Samsung: turn off Settings › Security and privacy › Auto Blocker. Xiaomi: turn on Developer options › USB debugging (Security settings)."
   elif ((code >= 128)); then
@@ -791,9 +963,10 @@ open_app() {
   args=(-s "$serial" --new-display="$(tile_size)/$APP_DPI" --flex-display --start-app="$pkg"
     --window-title="$name" "${wargs[@]}" "${COMMON_ARGS[@]}" "${APP_ARGS[@]}")
   is_tailnet_serial "$serial" && args+=("${REMOTE_ARGS[@]}")
-  audio_busy && args+=(--no-audio)
+  args+=(--no-audio)
 
   spawn "phonelink.$pkg" "$name" "${args[@]}"
+  sound_apply "$pkg" "$serial"
   [[ -n ${PHONELINK_DRY_RUN:-} ]] && return
   warn_if_relayed "$serial"
 
@@ -814,9 +987,10 @@ mirror() {
   mapfile -t wargs < <(window_args)
   args=(-s "$serial" --window-title="$label" "${wargs[@]}" "${COMMON_ARGS[@]}" "${MIRROR_ARGS[@]}")
   is_tailnet_serial "$serial" && args+=("${REMOTE_ARGS[@]}")
-  audio_busy && args+=(--no-audio)
+  args+=(--no-audio)
 
   spawn "phonelink" "$label" "${args[@]}"
+  sound_apply mirror "$serial"
   [[ -n ${PHONELINK_DRY_RUN:-} ]] && return
   warn_if_relayed "$serial"
   wait_for_window "phonelink"
@@ -1032,10 +1206,12 @@ connect() {
 
 disconnect() {
   local pid serial
-  # Close the phone windows phonelink opened, then drop the Wi-Fi links.
-  for pid in $(pgrep -x scrcpy); do
-    tr '\0' '\n' <"/proc/$pid/environ" 2>/dev/null | grep -q '^SDL_APP_ID=phonelink' && kill "$pid"
-  done
+  # Close the phone windows phonelink opened and the sound connection, then
+  # drop the Wi-Fi links.
+  touch "$STOPPING_FILE"
+  while IFS=$'\t' read -r pid _; do
+    kill "$pid" 2>/dev/null
+  done < <(phonelink_processes)
   direct_disconnect
   rm -f "$TCP_FILE"
   adb_running || {
@@ -1090,7 +1266,7 @@ adb_running() {
 
 # State for the bar widget, as JSON. --brief skips asking the phone its name.
 status_json() {
-  local via=none serial="" name="" direct=false supported=false mirror=false relayed=false nearby classes apps pkg icon f
+  local via=none serial="" name="" direct=false supported=false mirror=false relayed=false sound=phone nearby classes apps pkg icon f pid
   [[ -n $(p2p_device) ]] && supported=true
   direct_link_up && direct=true
 
@@ -1127,16 +1303,28 @@ status_json() {
       valid_pkg "$pkg" || continue
       icon="$ICON_DIR/phonelink.$pkg.png"
       [[ -s $icon ]] || icon=""
-      printf '%s\t%s\t%s\t%s\t%s\n' "$pkg" "$(app_name "$pkg")" "$icon" \
-        "$(is_pinned "$pkg" && echo 1)" "$(grep -qxF "phonelink.$pkg" <<<"$classes" && echo 1)"
+      printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$pkg" "$(app_name "$pkg")" "$icon" \
+        "$(is_pinned "$pkg" && echo 1)" "$(grep -qxF "phonelink.$pkg" <<<"$classes" && echo 1)" "$(sound_pref "$pkg")"
     done | jq -R -s 'split("\n") | map(select(length > 0) | split("\t")
-      | { package: .[0], name: .[1], icon: .[2], pinned: (.[3] == "1"), open: (.[4] == "1") })'
+      | { package: .[0], name: .[1], icon: .[2], pinned: (.[3] == "1"), open: (.[4] == "1"), sound: .[5] })'
   )
+  # A sound connection with no window left (one that crashed, say) would keep
+  # the phone silent; the bar's regular check ends it. A young one may belong
+  # to a window that's still starting.
+  pid=$(sound_pid)
+  if [[ -n $pid ]]; then
+    if [[ -z $(open_window_keys) ]] && (($(ps -o etimes= -p "$pid" 2>/dev/null || echo 0) > 10)); then
+      sound_stop
+    else
+      sound=pc
+    fi
+  fi
 
   jq -n --arg via "$via" --arg name "$name" --argjson direct "$direct" --argjson supported "$supported" \
     --argjson mirror "$mirror" --argjson relayed "$relayed" --argjson apps "${apps:-[]}" \
+    --arg sound "$sound" --arg mirrorSound "$(sound_pref mirror)" \
     '{ connected: ($via != "none"), via: $via, relayed: $relayed, name: $name, direct: $direct,
-       directSupported: $supported, mirrorOpen: $mirror, apps: $apps }'
+       directSupported: $supported, mirrorOpen: $mirror, sound: $sound, mirrorSound: $mirrorSound, apps: $apps }'
 }
 
 # ---------------------------------------------------------------- main
@@ -1154,6 +1342,7 @@ pin) require_tools; pin_menu ;;
 pair) require_tools; pair ;;
 connect) require_tools; connect "${1:-}" ;;
 direct) require_tools; direct "${1:-on}" ;;
+sound) require_tools; sound_cmd "${1:-toggle}" "${2:-}" ;;
 wifi) require_tools; wifi ;;
 stop | disconnect) require_tools; disconnect ;;
 refresh)
