@@ -54,7 +54,7 @@
   "whereTailscale": "Tailscale assigned both addresses.",
   "whereTailscaleLearned": "phonelink noted the phone's while it was nearby, and checked it against your tailnet.",
   "whereTailscaleSetting": "Set by TAILSCALE_HOST in your phonelink config.",
-  "whereTailscaleOnly": "It's the only Android device on your tailnet.",
+  "whereTailscaleOnly": "It's your only Android device on the tailnet.",
   "whereTailscaleOff": "Tailscale isn't set up for this phone.",
   "tailscaleOffline": "The phone is offline on Tailscale.",
   "tailscaleDirect": "Traffic takes a direct path, through %1.",

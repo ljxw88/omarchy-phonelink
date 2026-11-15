@@ -152,9 +152,11 @@ computer's current output, as set in Omarchy's audio panel.
 phonelink remembers the phones it has used, by serial number, in
 `~/.local/state/phonelink/phones`, and leaves other Android devices alone. It
 never uses emulators or virtual machines. It learns a phone when you pair it
-with `phonelink pair`, use it over USB, or set it as `SERIAL` in the config,
-and uses the first phone it finds while it knows none. A window that loses its
-connection only reconnects to the same phone.
+with `phonelink pair`, connect to it with `phonelink connect`, use it over USB,
+or set it as `SERIAL` in the config, and uses the first phone it finds while it
+knows none. A USB device it doesn't know is used only when none of yours
+answers. Over Tailscale it only uses your own Android devices. A window that
+loses its connection only reconnects to the same phone.
 
 ## Commands
 
@@ -185,8 +187,8 @@ phonelink network      Show every way to the phone, with addresses and where the
 phonelink network --panel  Open the network map in the bar
 ```
 
-`phonelink stop` also disconnects every other device adb reaches over Wi-Fi,
-such as other phones and TVs, closes port 5555 if `phonelink wifi` opened it,
+`phonelink stop` also disconnects other phones and TVs that adb reaches over
+Wi-Fi, closes port 5555 if `phonelink wifi` opened it,
 and stops adb unless a USB device or an emulator is connected.
 `phonelink status` and `phonelink doctor` start adb again, which reconnects
 the phone.
@@ -266,8 +268,8 @@ The phone then listens on port 5555 until it restarts, on any network,
 including mobile data. phonelink tries that port over Tailscale. A computer the
 phone hasn't allowed before has to be approved on the phone's screen.
 Unlike Wireless debugging, this port isn't encrypted, so avoid it on shared
-networks. `phonelink wifi off` or `phonelink stop` closes it. If the phone is
-already connected over Wi-Fi, `phonelink wifi` doesn't restart anything.
+networks. `phonelink wifi off` or `phonelink stop` closes it. If the port is
+already open, `phonelink wifi` leaves it as it is.
 
 **Speed:** video starts lighter over Tailscale, and the direct Wi-Fi link is
 off, since the phone isn't nearby. How smooth it is depends on the

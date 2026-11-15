@@ -1771,6 +1771,17 @@ better_path() {
 }
 
 # The first of the serials read that reaches the phone with identity $1.
+# Prints the first serial in file $1 that reaches one of your phones.
+own_phone_of() {
+  local c id
+  while read -r c; do
+    [[ -n $c ]] && id=$(phone_id "$c" </dev/null) && phone_wanted "$id" || continue
+    printf '%s' "$c"
+    return 0
+  done <"$1"
+  return 1
+}
+
 first_of_phone() {
   local c
   while read -r c; do
@@ -2300,7 +2311,7 @@ pair() {
 # isn't encrypted, and it stays open until the phone restarts or
 # `phonelink wifi off`.
 wifi() {
-  local serial id ip c deadline
+  local serial id ip deadline
   if [[ ${1:-} == off ]]; then
     wifi_off
     return
@@ -2311,16 +2322,16 @@ wifi() {
   id=$(phone_id "$serial")
   learn_phone "$id"
 
-  # Switching restarts the phone's adb, which drops every connection to it,
-  # windows included, so not when it's on Wi-Fi already.
-  for c in $(nearby_wireless); do
-    [[ $(phone_id "$c") == "$id" ]] && phone_alive "$c" || continue
-    notify "Phone" "Already on Wi-Fi · unplug any time"
-    return 0
-  done
-
   ip=$(adb -s "$serial" shell ip -f inet addr show wlan0 2>/dev/null | awk '/inet / { sub(/\/.*/, "", $2); print $2; exit }')
   [[ -n $ip ]] || die "Your phone isn't on Wi-Fi."
+
+  # Switching restarts the phone's adb, which drops every connection to it
+  # until the windows reconnect, so not when the port is open already.
+  if connect_phone "$ip:5555" "$id"; then
+    echo "$ip:5555" >"$TCP_FILE"
+    notify "Phone on Wi-Fi" "Already on · unplug any time"
+    return 0
+  fi
 
   adb -s "$serial" tcpip 5555 &>/dev/null || die "Couldn't switch the phone to Wi-Fi."
   deadline=$((SECONDS + 10))
@@ -2481,23 +2492,29 @@ adb_running() {
 # State for the bar widget, as JSON. --brief skips asking the phone its name.
 status_json() {
   local via=none serial="" name="" direct=false supported=false mirror=false relayed=false reconnecting=false
-  local nearby classes apps pkg icon f app sound=phone pid
+  local classes apps pkg icon f app sound=phone pid usb found
   [[ -n $(p2p_device) ]] && supported=true
   direct_link_up && direct=true
 
+  # The same phone pick_device would use: yours first, on any path, and a USB
+  # device phonelink doesn't know only when none of yours is there.
   if adb_running; then
-    nearby=$(nearby_devices)
-    if serial=$(usb_devices <<<"$nearby" | head -1) && [[ -n $serial ]]; then
+    usb=$(usb_phone)
+    found=$?
+    if ((found == 0)); then
+      serial=$usb
       via=usb
     elif serial=$(direct_serial); then
       via=direct
-    elif [[ -n $nearby ]]; then
-      serial=$(head -1 <<<"$nearby")
+    elif serial=$(own_phone_of <(nearby_wireless)); then
       via=wifi
-    elif serial=$(tailnet_devices | head -1) && [[ -n $serial ]]; then
+    elif serial=$(own_phone_of <(tailnet_devices)); then
       via=tailscale
       # While traffic flows, an empty CurAddr means Tailscale is relaying.
       tailnet_peer "${serial%:*}" | jq -e '.Active and .CurAddr == ""' &>/dev/null && relayed=true
+    elif [[ -n $usb ]]; then
+      serial=$usb
+      via=usb
     fi
     [[ $via == none || ${1:-} == --brief ]] || name=$(device_label "$serial")
   fi
@@ -2825,7 +2842,7 @@ network_text() {
       elif .kind == "wifi" then "Your router gave both addresses (DHCP)."
         + ({mdns: " The phone announced itself over mDNS (Wireless debugging).", tcpip: " Set up with phonelink wifi over USB.", connected: "", phone: " Read from the phone itself."}[.found // ""] // "")
       else "Tailscale assigns these."
-        + ({learned: " phonelink noted the phone'"'"'s while it was nearby, and checked it against your tailnet.", setting: " Set by TAILSCALE_HOST in your config.", "only-android": " It is the only Android device on your tailnet."}[.found // ""] // "")
+        + ({learned: " phonelink noted the phone'"'"'s while it was nearby, and checked it against your tailnet.", setting: " Set by TAILSCALE_HOST in your config.", "only-android": " It is your only Android device on the tailnet."}[.found // ""] // "")
         + (if .peer and .peer.online == false then " The phone is offline on Tailscale." elif .peer.direct then " Direct path: \(.peer.direct)." elif .peer.active then " Relayed through \(.peer.relay)." else "" end)
       end;
     def state_text: {active: "in use", connected: "connected", available: "available", off: "not connected", unsupported: "not supported here"}[.];
