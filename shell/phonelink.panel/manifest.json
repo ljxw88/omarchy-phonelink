@@ -1,0 +1,21 @@
+{
+  "schemaVersion": 1,
+  "id": "phonelink.panel",
+  "name": "Phone",
+  "version": "1.0.0",
+  "author": "ljxw88",
+  "description": "Your Android phone's apps and screen, from the bar. Part of omarchy-phonelink.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "Phone",
+    "description": "Open phone apps, mirror the phone screen, and manage the connection",
+    "category": "Network",
+    "allowMultiple": false,
+    "defaultSection": "right"
+  }
+}

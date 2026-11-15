@@ -79,6 +79,26 @@ fi
 hyprctl reload >/dev/null || true
 command -v omarchy &>/dev/null && omarchy menu refresh >/dev/null 2>&1 || true
 
+step "Adding the Phone icon to the bar"
+plugin_dir="$HOME/.config/omarchy/plugins/phonelink.panel"
+updating=false
+[[ -d $plugin_dir ]] && updating=true
+mkdir -p "$plugin_dir"
+cp -r shell/phonelink.panel/. "$plugin_dir/"
+if command -v omarchy-shell &>/dev/null; then
+  if $updating; then
+    # Hot reload can miss changes to a running widget; a restart can't.
+    omarchy restart shell >/dev/null 2>&1 || true
+  else
+    omarchy-shell shell rescanPlugins >/dev/null 2>&1 || true
+    for _ in 1 2 3 4 5; do
+      sleep 1
+      omarchy plugin enable phonelink.panel --before omarchy.bluetooth >/dev/null 2>&1 && break
+      omarchy plugin enable phonelink.panel --section right >/dev/null 2>&1 && break
+    done
+  fi
+fi
+
 errors=$(hyprctl configerrors 2>/dev/null | grep -v '^\s*$' || true)
 if [[ -n $errors ]]; then
   echo "Hyprland reported config errors:" >&2

@@ -18,8 +18,9 @@ which does the video and input.
   laptop. phonelink links the two straight to each other with Wi-Fi Direct, the
   connection Smart View uses, while both stay on your home network. It sets
   this up by itself and taps the phone's Connect prompt for you.
-- **Fits into Omarchy.** A Phone menu, keybindings, tiling window rules,
-  launcher entries with real app icons, theme colors and Omarchy notifications.
+- **Fits into Omarchy.** A phone icon in the bar, a Phone menu, keybindings,
+  tiling window rules, launcher entries with real app icons, theme colors and
+  Omarchy notifications.
 - **Wi-Fi pairing with a QR code**, so you never need a cable.
 
 ## Requirements
@@ -48,6 +49,7 @@ The installer adds any missing packages (`scrcpy`, `android-tools`,
 - adds `~/.config/hypr/phonelink.lua` (keybindings and window rules) and loads
   it from `~/.config/hypr/hyprland.lua`
 - adds a Phone section to `~/.config/omarchy/extensions/omarchy-menu.jsonc`
+- adds a phone icon to the bar (the `phonelink.panel` shell plugin)
 - adds a "Phone" entry to the app launcher
 - creates `~/.config/phonelink/config` for your settings
 
@@ -76,6 +78,21 @@ if USB debugging is greyed out or mouse input is blocked.
 | Open a phone app | **Super + Alt + P** |
 | Mirror the whole phone | **Super + Alt + Shift + P** |
 | Everything else | **Omarchy menu › Phone** |
+
+### The bar icon
+
+The phone icon in the bar is dimmed when no phone is connected and takes your
+theme's accent color while a phone window is open.
+
+- **Left click** opens a panel with the phone's name and connection, a Mirror
+  row, your recent and pinned apps with their icons, the Direct Wi-Fi link
+  switch, and Disconnect. Arrow keys or j/k move through it, Enter opens, Esc
+  closes.
+- **Right click** mirrors the phone.
+- **Middle click** opens the full app picker.
+
+Move it with `omarchy bar move phonelink.panel --section <section>`, or drag it
+along the bar.
 
 Inside a phone window:
 

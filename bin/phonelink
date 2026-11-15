@@ -79,6 +79,9 @@ require_tools() {
 app_name() {
   local name
   name=$(awk -F'\t' -v p="$1" '$2 == p { print $1; exit }' "$APPS_CACHE" 2>/dev/null)
+  if [[ -z $name ]]; then
+    name=$(sed -n 's/^Name=\(.*\) (Phone)$/\1/p' "$DESKTOP_DIR/phonelink.$1.desktop" 2>/dev/null | head -1)
+  fi
   printf '%s' "${name:-$1}"
 }
 
@@ -758,6 +761,62 @@ usage() {
   grep -E '^#   phonelink' "$SELF" | sed 's/^# //'
 }
 
+# Checks for the adb server without starting it: starting it would reconnect
+# a phone the user just disconnected.
+adb_running() {
+  ss -Hltn 'sport = :5037' 2>/dev/null | grep -q .
+}
+
+# State for the bar widget, as JSON. --brief skips asking the phone its name.
+status_json() {
+  local via=none serial="" name="" direct=false supported=false mirror=false devices classes apps pkg icon f
+  [[ -n $(p2p_device) ]] && supported=true
+  direct_link_up && direct=true
+
+  if adb_running; then
+    devices=$(ready_devices)
+    if [[ -n $devices ]]; then
+      serial=$(grep -vE ':|_adb-tls-connect' <<<"$devices" | head -1)
+      if [[ -n $serial ]]; then
+        via=usb
+      elif serial=$(direct_serial); then
+        via=direct
+      else
+        serial=$(head -1 <<<"$devices")
+        via=wifi
+      fi
+      [[ ${1:-} == --brief ]] || name=$(device_label "$serial")
+    fi
+  fi
+
+  classes=$(hyprctl clients -j 2>/dev/null | jq -r '.[].class' | grep '^phonelink' || true)
+  grep -qxF phonelink <<<"$classes" && mirror=true
+
+  # Recently opened apps first, then pinned ones, at most eight.
+  apps=$(
+    {
+      cat "$RECENT_FILE" 2>/dev/null
+      for f in "$DESKTOP_DIR"/phonelink.*.desktop; do
+        pkg=${f##*/phonelink.}
+        pkg=${pkg%.desktop}
+        is_pinned "$pkg" && echo "$pkg"
+      done
+    } | awk '!seen[$0]++' | head -8 | while read -r pkg; do
+      valid_pkg "$pkg" || continue
+      icon="$ICON_DIR/phonelink.$pkg.png"
+      [[ -s $icon ]] || icon=""
+      printf '%s\t%s\t%s\t%s\t%s\n' "$pkg" "$(app_name "$pkg")" "$icon" \
+        "$(is_pinned "$pkg" && echo 1)" "$(grep -qxF "phonelink.$pkg" <<<"$classes" && echo 1)"
+    done | jq -R -s 'split("\n") | map(select(length > 0) | split("\t")
+      | { package: .[0], name: .[1], icon: .[2], pinned: (.[3] == "1"), open: (.[4] == "1") })'
+  )
+
+  jq -n --arg via "$via" --arg name "$name" --argjson direct "$direct" --argjson supported "$supported" \
+    --argjson mirror "$mirror" --argjson apps "${apps:-[]}" \
+    '{ connected: ($via != "none"), via: $via, name: $name, direct: $direct,
+       directSupported: $supported, mirrorOpen: $mirror, apps: $apps }'
+}
+
 # ---------------------------------------------------------------- main
 
 cmd=${1:-menu}
@@ -781,7 +840,14 @@ refresh)
   echo "Apps: $(wc -l <"$APPS_CACHE")"
   notify "Phone" "Found $(wc -l <"$APPS_CACHE") apps on your phone."
   ;;
-status) require_tools; status ;;
+status)
+  if [[ ${1:-} == --json ]]; then
+    status_json "${2:-}"
+  else
+    require_tools
+    status
+  fi
+  ;;
 -h | --help | help) usage ;;
 *) usage; exit 1 ;;
 esac

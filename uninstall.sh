@@ -30,6 +30,8 @@ remove_config_lines() {
 
 main() {
   disconnect
+  command -v omarchy &>/dev/null && omarchy plugin disable phonelink.panel >/dev/null 2>&1
+  rm -rf "$HOME/.config/omarchy/plugins/phonelink.panel"
   remove_files
   remove_config_lines
   hyprctl reload >/dev/null 2>&1
