@@ -15,6 +15,7 @@ disconnect() {
 remove_files() {
   rm -f "$HOME/.local/bin/phonelink" \
     "$HOME/.config/hypr/phonelink.lua" \
+    "$HOME/.config/hypr/phonelink.lua.new" \
     "$HOME/.local/share/applications/phonelink.desktop" \
     "$HOME"/.local/share/applications/phonelink.*.desktop \
     "$HOME"/.local/share/icons/hicolor/256x256/apps/phonelink.*.png
@@ -25,7 +26,11 @@ remove_config_lines() {
   [[ -f $HYPR_FILE ]] &&
     sed -i '/^-- Android phone windows (phonelink)\.$/d; /^require("hypr\.phonelink")$/d' "$HYPR_FILE"
   [[ -f $MENU_FILE ]] &&
-    sed -i '/^ *\/\/ Android phone (phonelink, built on scrcpy)\.$/d; /^ *"phone[".]/d' "$MENU_FILE"
+    sed -i -E \
+      -e '/^ *\/\/ >>> phonelink >>>/,/^ *\/\/ <<< phonelink <<</d' \
+      -e '/^ *\/\/ Android phone \(phonelink, built on scrcpy\)\.$/d' \
+      -e '/^ *"phone(\.(apps|mirror|pin|refresh|stop|wireless(\.(direct|connect|pair|usb|disconnect))?))?":/d' \
+      "$MENU_FILE"
 }
 
 main() {

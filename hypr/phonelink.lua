@@ -1,8 +1,15 @@
 -- phonelink: use your Android phone from Omarchy (built on scrcpy).
 -- https://github.com/ljxw88/omarchy-phonelink
+--
+-- Updates replace this file unless you've edited it, in which case the new
+-- version is saved beside it as phonelink.lua.new.
 
-o.bind("SUPER + ALT + P", "Phone apps", "phonelink apps")
-o.bind("SUPER + ALT + SHIFT + P", "Mirror phone screen", "phonelink mirror")
+-- To keep these keys for something else, set `phonelink_bindings = false` in
+-- hyprland.lua above the line that loads this file.
+if phonelink_bindings ~= false then
+  o.bind("SUPER + ALT + P", "Phone apps", "phonelink apps")
+  o.bind("SUPER + ALT + SHIFT + P", "Mirror phone screen", "phonelink mirror")
+end
 
 -- The mirror's class is "phonelink"; each phone app is "phonelink.<package>".
 -- Both tile like any other window. Phone apps resize with their tile; the

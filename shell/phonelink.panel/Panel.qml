@@ -70,7 +70,12 @@ Panel {
     for (var i = 0; i < apps.length; i++) list.push({ kind: "app", group: 1, app: apps[i] })
     list.push({ kind: "all", group: 1 })
     if (directSupported) list.push({ kind: "direct", group: 2 })
-    list.push({ kind: connected ? "disconnect" : "pair", group: 2 })
+    if (connected) {
+      list.push({ kind: "disconnect", group: 2 })
+    } else {
+      list.push({ kind: "connect", group: 2 })
+      list.push({ kind: "pair", group: 2 })
+    }
     return list
   }
 
@@ -98,14 +103,40 @@ Panel {
     else if (row.kind === "app") run(["open", row.app.package])
     else if (row.kind === "all") run(["apps"])
     else if (row.kind === "disconnect") run(["stop"])
+    else if (row.kind === "connect") run(["connect"])
     else if (row.kind === "pair") run(["pair"])
   }
 
   function toggleDirect() {
     if (directBusy) return
-    directBusy = true
+    shareDirectBusy(true)
     directProcess.command = [root.command, "direct", directUp ? "off" : "on"]
     directProcess.running = true
+  }
+
+  // The bar puts a copy of this widget on every monitor. The first copy checks
+  // the phone for all of them and hands each what it found.
+  function copies() {
+    var items = bar && typeof bar.moduleWidgets === "function" ? bar.moduleWidgets(moduleName).slice() : []
+    if (items.indexOf(root) < 0) items.push(root)
+    return items
+  }
+
+  // Should the bar ever list its widgets some other way, every copy checks
+  // for itself rather than none of them.
+  function isLeader() {
+    var items = bar && typeof bar.moduleWidgets === "function" ? bar.moduleWidgets(moduleName) : []
+    return items.indexOf(root) <= 0
+  }
+
+  function shareDirectBusy(busy) {
+    var items = copies()
+    for (var i = 0; i < items.length; i++)
+      if (items[i] && typeof items[i].setDirectBusy === "function") items[i].setDirectBusy(busy)
+  }
+
+  function setDirectBusy(busy) {
+    directBusy = busy
   }
 
   function moveCursor(dy) {
@@ -146,12 +177,6 @@ Panel {
     }
     if (!data || typeof data !== "object") return
 
-    connected = !!data.connected
-    via = ["direct", "wifi", "usb"].indexOf(data.via) >= 0 ? data.via : "none"
-    if (typeof data.name === "string" && data.name !== "") deviceName = data.name.slice(0, 80)
-    directUp = !!data.direct
-    directSupported = !!data.directSupported
-
     var list = []
     var source = Array.isArray(data.apps) ? data.apps : []
     for (var i = 0; i < source.length && list.length < 8; i++) {
@@ -166,7 +191,27 @@ Panel {
         pinned: !!app.pinned
       })
     }
-    apps = list
+
+    var status = {
+      connected: !!data.connected,
+      via: ["direct", "wifi", "usb"].indexOf(data.via) >= 0 ? data.via : "none",
+      name: typeof data.name === "string" ? data.name.slice(0, 80) : "",
+      direct: !!data.direct,
+      directSupported: !!data.directSupported,
+      apps: list
+    }
+    var items = copies()
+    for (var j = 0; j < items.length; j++)
+      if (items[j] && typeof items[j].applyStatus === "function") items[j].applyStatus(status)
+  }
+
+  function applyStatus(status) {
+    connected = status.connected
+    via = status.via
+    if (status.name !== "") deviceName = status.name
+    directUp = status.direct
+    directSupported = status.directSupported
+    apps = status.apps
     loaded = true
   }
 
@@ -191,7 +236,7 @@ Panel {
     running: false
     command: []
     onExited: {
-      root.directBusy = false
+      root.shareDirectBusy(false)
       root.refresh(!root.opened)
     }
   }
@@ -203,7 +248,7 @@ Panel {
     running: true
     repeat: true
     triggeredOnStart: true
-    onTriggered: root.refresh(!root.opened)
+    onTriggered: if (root.isLeader()) root.refresh(!root.opened)
   }
 
   Timer {
@@ -380,6 +425,7 @@ Panel {
       : kind === "all" ? "󰀻"
       : kind === "direct" ? "󰖩"
       : kind === "disconnect" ? "󰅙"
+      : kind === "connect" ? "󰌘"
       : "󰐲"
 
     readonly property string iconPath: kind === "app" ? rowData.app.icon : ""
@@ -389,6 +435,7 @@ Panel {
       : kind === "all" ? strings.t("allApps")
       : kind === "direct" ? strings.t("direct")
       : kind === "disconnect" ? strings.t("disconnect")
+      : kind === "connect" ? strings.t("connect")
       : strings.t("pair")
 
     readonly property string caption: {
@@ -397,6 +444,7 @@ Panel {
       if (kind === "all") return strings.t("allAppsCaption")
       if (kind === "direct") return root.directBusy ? strings.t("directBusy") : (root.directUp ? strings.t("directOn") : strings.t("directOff"))
       if (kind === "disconnect") return strings.t("disconnectCaption")
+      if (kind === "connect") return strings.t("connectCaption")
       return strings.t("pairCaption")
     }
 

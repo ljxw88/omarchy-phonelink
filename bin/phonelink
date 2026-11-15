@@ -8,6 +8,7 @@
 #   phonelink mirror       Mirror and control the whole phone screen
 #   phonelink pin          Choose which phone apps appear in the app launcher
 #   phonelink pair         Pair over Wi-Fi with a QR code (Android 11+)
+#   phonelink connect      Connect to a paired phone
 #   phonelink direct       Link straight to the phone with Wi-Fi Direct (faster)
 #   phonelink direct off   Drop the direct link
 #   phonelink wifi         Switch a USB-connected phone to Wi-Fi
@@ -44,12 +45,14 @@ ICON_DIR="$ICON_ROOT/256x256/apps"
 # Defaults. Override any of them in ~/.config/phonelink/config.
 SERIAL=""                          # pin one phone when several are connected
 DIRECT="auto"                      # auto = use a Wi-Fi Direct link when on Wi-Fi, off = always via the router
+APP_ICONS="play"                   # play = app icons from Google Play (sends it the app's package name), off = a generic icon
 KEYBOARD="uhid"                    # uhid = real keyboard on the phone, sdk = injected text
 APP_DPI=200                        # app window density; higher makes the app UI bigger
 APP_ARGS=(--no-vd-system-decorations --keep-active)
 MIRROR_ARGS=(--max-size=1600)
 COMMON_ARGS=(--video-bit-rate=10M)
 
+# shellcheck source=/dev/null
 [[ -f $CONFIG_FILE ]] && source "$CONFIG_FILE"
 
 mkdir -p "$STATE_DIR" "$LOG_DIR"
@@ -135,8 +138,20 @@ tile_size() {
 
 # ---------------------------------------------------------------- devices
 
-ready_devices() {
+# Every device adb knows, emulators included.
+all_devices() {
   adb devices 2>/dev/null | awk 'NR > 1 && $2 == "device" { print $1 }'
+}
+
+# Phones only. Emulators belong to Android Studio, and one listed without an
+# address would otherwise pass for a phone on USB.
+ready_devices() {
+  all_devices | grep -v '^emulator-' || true
+}
+
+# Devices on USB have neither an address nor an mDNS name.
+usb_devices() {
+  grep -vE ':|_adb-tls-connect' || true
 }
 
 connect_wireless() {
@@ -158,8 +173,8 @@ pick_device() {
   adb start-server &>/dev/null
 
   if [[ -n $SERIAL ]]; then
-    ready_devices | grep -qxF "$SERIAL" || connect_wireless
-    ready_devices | grep -qxF "$SERIAL" || die "Phone $SERIAL isn't connected."
+    all_devices | grep -qxF "$SERIAL" || connect_wireless
+    all_devices | grep -qxF "$SERIAL" || die "Phone $SERIAL isn't connected."
     printf '%s' "$SERIAL"
     return
   fi
@@ -177,7 +192,7 @@ pick_device() {
     die "No phone found. Plug it in with USB debugging on, or pair it over Wi-Fi from the Phone menu."
   fi
 
-  serial=$(grep -vE ':|_adb-tls-connect' <<<"$devices" | head -1)
+  serial=$(usb_devices <<<"$devices" | head -1)
   if [[ -n $serial ]]; then
     printf '%s' "$serial"
     return
@@ -188,9 +203,16 @@ pick_device() {
     return
   fi
 
+  # A direct link that dropped can still be listed for a while; skip it.
   serial=$(grep -vxF "$(cat "$DIRECT_FILE" 2>/dev/null)" <<<"$devices" | head -1)
+  if [[ -z $serial ]]; then
+    connect_wireless
+    serial=$(ready_devices | grep -vxF "$(cat "$DIRECT_FILE" 2>/dev/null)" | head -1)
+    [[ -n $serial ]] || die "No phone found. Check that Wireless debugging is on, or pair it from the Phone menu."
+  fi
+
   if [[ $want_direct == direct && $DIRECT == auto && -n $(p2p_device) ]] && direct_allowed; then
-    if direct=$(direct_connect "$serial"); then
+    if direct=$(direct_connect_locked "$serial"); then
       printf '%s' "$direct"
       return
     fi
@@ -250,24 +272,56 @@ p2p_peers() {
   done
 }
 
-# Taps Connect on the phone's Wi-Fi Direct invitation, so the user needn't.
+# This computer's Wi-Fi Direct address, as the phone sees it.
+our_p2p_address() {
+  iw dev 2>/dev/null | awk '$1 == "addr" { addr = $2 } $1 == "type" && $2 == "P2P-device" { print addr; exit }'
+}
+
+# Taps Connect on the phone's Wi-Fi Direct invitation, so the user needn't,
+# but only when the invitation comes from this computer: while Android asks,
+# it keeps the requesting device's address in mSavedPeerConfig.
 accept_invitation() {
-  local xml node x1 y1 x2 y2
-  xml=$(adb -s "$1" exec-out uiautomator dump /dev/tty 2>/dev/null)
-  node=$(grep -oE '<node [^>]*resource-id="android:id/button1"[^>]*package="[^"]*wifi[^"]*"[^>]*>' <<<"$xml" | head -1)
+  local serial=$1 ours=$2 xml node from x1 y1 x2 y2
+  [[ -n $ours ]] || return 1
+  xml=$(adb -s "$serial" exec-out uiautomator dump /dev/tty 2>/dev/null)
+  node=$(grep -oE '<node [^>]*resource-id="android:id/button1"[^>]*package="com\.android\.wifi\.dialog"[^>]*>' <<<"$xml" | head -1)
   [[ -n $node ]] || return 1
+
+  from=$(adb -s "$serial" shell dumpsys wifip2p 2>/dev/null |
+    awk '/mSavedPeerConfig/ { found = 1 } found && $1 == "address:" { print $2; exit }' | tr -d '\r')
+  [[ -n $from && ${from,,} == "${ours,,}" ]] || return 1
+
   read -r x1 y1 x2 y2 < <(grep -oE 'bounds="[^"]*"' <<<"$node" | grep -oE '[0-9]+' | tr '\n' ' ')
-  adb -s "$1" shell input tap $(((x1 + x2) / 2)) $(((y1 + y2) / 2)) &>/dev/null
+  adb -s "$serial" shell input tap $(((x1 + x2) / 2)) $(((y1 + y2) / 2)) &>/dev/null
+}
+
+# Leaves the Wi-Fi Direct page phonelink opened, without pressing Back in
+# whatever the user has switched to since.
+close_wifi_direct_page() {
+  adb -s "$1" shell dumpsys activity activities 2>/dev/null | grep -m1 'topResumedActivity' |
+    grep -q 'WifiP2pSettingsActivity' && adb -s "$1" shell input keyevent KEYCODE_BACK &>/dev/null
 }
 
 phone_locked() {
   adb -s "$1" shell dumpsys window 2>/dev/null | grep -q "isKeyguardShowing=true"
 }
 
+# Only one direct-link setup at a time. A second caller waits for the first,
+# then uses the link it made.
+direct_connect_locked() {
+  local serial=$1 lock result=""
+  exec {lock}>"$STATE_DIR/direct.lock"
+  if flock -w 120 "$lock"; then
+    result=$(direct_serial) || result=$(direct_connect "$serial") || result=""
+  fi
+  exec {lock}>&-
+  [[ -n $result ]] && printf '%s' "$result"
+}
+
 # Links the laptop and the phone (reached as $1 over the router) with
 # Wi-Fi Direct, and prints the phone's adb serial over that link.
 direct_connect() {
-  local serial=$1 dev path port name known peer pid ok iface ip phone _
+  local serial=$1 dev path port name known peer pid ok iface ip phone ours _
   dev=$(p2p_device)
   [[ -n $dev ]] || return 1
   path=$(nmcli -g GENERAL.DBUS-PATH device show "$dev" 2>/dev/null)
@@ -284,9 +338,10 @@ direct_connect() {
     phone_locked "$serial" && return 1
   fi
 
-  notify "Phone" "Setting up a direct Wi-Fi link to your phone…"
+  notify "Phone" "Setting up a direct Wi-Fi link to your phone. Tap Connect on the phone if it asks."
   name=$(adb -s "$serial" shell settings get global device_name 2>/dev/null | tr -d '\r')
   known=$(cat "$DIRECT_PEER_FILE" 2>/dev/null)
+  ours=$(our_p2p_address)
 
   # Android only answers Wi-Fi Direct while its settings page is searching,
   # and only starts searching when the page opens fresh.
@@ -301,7 +356,7 @@ direct_connect() {
     sleep 1
   done
   if [[ -z $peer ]]; then
-    adb -s "$serial" shell input keyevent KEYCODE_BACK &>/dev/null
+    close_wifi_direct_page "$serial"
     return 1
   fi
   echo "$peer" >"$DIRECT_PEER_FILE"
@@ -316,12 +371,12 @@ direct_connect() {
   nmcli --wait 45 connection up "$DIRECT_CON" &>/dev/null &
   pid=$!
   while kill -0 "$pid" 2>/dev/null; do
-    accept_invitation "$serial" && break
+    accept_invitation "$serial" "$ours" && break
     sleep 1
   done
   wait "$pid"
   ok=$?
-  adb -s "$serial" shell input keyevent KEYCODE_BACK &>/dev/null
+  close_wifi_direct_page "$serial"
   ((ok == 0)) || return 1
 
   # Android runs the link at .1 and hands the laptop an address. If the laptop
@@ -332,7 +387,7 @@ direct_connect() {
     [[ -n $ip ]] && break
     sleep 1
   done
-  [[ -n $ip ]] || return 1
+  [[ -n $ip ]] || { direct_link_down; return 1; }
   if [[ ${ip##*.} != 1 ]]; then
     phone="${ip%.*}.1"
   else
@@ -342,23 +397,27 @@ direct_connect() {
       sleep 1
     done
   fi
-  [[ -n $phone ]] || return 1
+  [[ -n $phone ]] || { direct_link_down; return 1; }
 
   for _ in {1..5}; do
     adb connect "$phone:$port" 2>/dev/null | grep -q "connected to" && break
     sleep 1
   done
-  ready_devices | grep -qxF "$phone:$port" || return 1
+  ready_devices | grep -qxF "$phone:$port" || { direct_link_down; return 1; }
 
   echo "$phone:$port" >"$DIRECT_FILE"
   rm -f "$DIRECT_FAIL_FILE"
   printf '%s' "$phone:$port"
 }
 
+direct_link_down() {
+  nmcli connection down "$DIRECT_CON" &>/dev/null
+}
+
 direct_disconnect() {
   [[ -s $DIRECT_FILE ]] && adb disconnect "$(<"$DIRECT_FILE")" &>/dev/null
   rm -f "$DIRECT_FILE"
-  nmcli connection down "$DIRECT_CON" &>/dev/null
+  direct_link_down
 }
 
 direct() {
@@ -381,7 +440,7 @@ direct() {
     serial=$(pick_device) || exit 1
     [[ $serial == *:* || $serial == *_adb-tls-connect* ]] || die "Your phone is on USB, which is already the fastest link."
     rm -f "$DIRECT_FAIL_FILE"
-    if direct=$(direct_connect "$serial"); then
+    if direct=$(direct_connect_locked "$serial"); then
       notify "Phone" "Direct link is up. Phone windows now skip your Wi-Fi router."
     else
       die "Couldn't set up the direct link. Keep the phone unlocked and close by, then try again."
@@ -422,7 +481,7 @@ refresh_apps() {
       print pending "\t" pkg
       pending = ""
     }
-  ' | sort -f -t $'\t' -k1,1 -k2,2 >"$tmp"
+  ' | awk -F'\t' '$2 ~ /^[A-Za-z0-9_]+(\.[A-Za-z0-9_]+)+$/' | sort -f -t $'\t' -k1,1 -k2,2 >"$tmp"
 
   if [[ -s $tmp ]]; then
     mv "$tmp" "$APPS_CACHE"
@@ -450,19 +509,25 @@ desktop_escape() {
   printf '%s' "$value"
 }
 
+# App icons come from the app's Google Play page, which tells Google the
+# package name. APP_ICONS=off keeps a generic icon instead.
 fetch_icon() {
   local pkg=$1 dest="$ICON_DIR/phonelink.$1.png" page url
+  [[ $APP_ICONS == play ]] && valid_pkg "$pkg" || return 1
   [[ -s $dest ]] && return 0
   mkdir -p "$ICON_DIR"
 
-  page=$(curl -fsSL --max-time 10 -A "Mozilla/5.0" "https://play.google.com/store/apps/details?id=$pkg&hl=en") || return 1
+  page=$(curl -fsSL --max-time 10 --max-filesize 8000000 -A "Mozilla/5.0" \
+    "https://play.google.com/store/apps/details?id=$pkg&hl=en") || return 1
   url=$(grep -oE '<meta property="og:image" content="[^"]+"' <<<"$page" | head -1 | sed -E 's/.*content="([^"]+)"/\1/')
   [[ $url == https://* ]] || return 1
 
-  curl -fsSL --max-time 10 -o "$dest.tmp" "${url%=*}=s256-br30" && mv "$dest.tmp" "$dest" || {
+  if curl -fsSL --max-time 10 --max-filesize 2000000 -o "$dest.tmp" "${url%=*}=s256-br30"; then
+    mv "$dest.tmp" "$dest"
+  else
     rm -f "$dest.tmp"
     return 1
-  }
+  fi
   gtk-update-icon-cache "$ICON_ROOT" &>/dev/null || true
 }
 
@@ -470,6 +535,7 @@ fetch_icon() {
 # window and show its icon. Pinning only makes the entry visible in the launcher.
 write_entry() {
   local pkg=$1 name=$2 hidden=$3 icon=phone
+  valid_pkg "$pkg" || return 1
   fetch_icon "$pkg" && icon="phonelink.$pkg"
   mkdir -p "$DESKTOP_DIR"
   cat >"$DESKTOP_DIR/phonelink.$pkg.desktop" <<EOF
@@ -495,15 +561,44 @@ is_pinned() {
 # Runs scrcpy detached from whatever launched us, and reports failures.
 # PHONELINK_DRY_RUN=1 prints the scrcpy command instead.
 spawn() {
+  local runner
   if [[ -n ${PHONELINK_DRY_RUN:-} ]]; then
     printf 'SDL_APP_ID=%q scrcpy' "$1"
     printf ' %q' "${@:3}"
     echo
-  elif command -v uwsm-app &>/dev/null; then
-    setsid -f uwsm-app -- "$SELF" __run "$@" &>/dev/null
-  else
-    setsid -f "$SELF" __run "$@" &>/dev/null
+    return
   fi
+
+  if command -v uwsm-app &>/dev/null; then
+    runner=(setsid -f uwsm-app -- "$SELF" __run "$@")
+  else
+    runner=(setsid -f "$SELF" __run "$@")
+  fi
+  # The window mustn't hold the launch lock for as long as it's open.
+  if [[ -n $LAUNCH_LOCK ]]; then
+    "${runner[@]}" &>/dev/null {LAUNCH_LOCK}>&-
+  else
+    "${runner[@]}" &>/dev/null
+  fi
+}
+
+# A phone window takes a few seconds to appear. Opening the same one again
+# meanwhile would start it twice, so the second attempt stands down while the
+# first holds this lock, and the first waits until its window is up.
+LAUNCH_LOCK=""
+launch_lock() {
+  exec {LAUNCH_LOCK}>"$STATE_DIR/launch.$1.lock"
+  flock -n "$LAUNCH_LOCK"
+}
+
+wait_for_window() {
+  local _
+  [[ -n ${PHONELINK_DRY_RUN:-} ]] && return 0
+  for _ in {1..60}; do
+    hyprctl clients -j 2>/dev/null | jq -e --arg c "$1" 'any(.[]; .class == $c)' &>/dev/null && return 0
+    sleep 0.25
+  done
+  return 1
 }
 
 run_scrcpy() {
@@ -531,8 +626,11 @@ open_app() {
   valid_pkg "$pkg" || die "Not an Android package name: $pkg"
   name=$(app_name "$pkg")
 
-  record_recent "$pkg"
-  focus_class "phonelink.$pkg" && return
+  if focus_class "phonelink.$pkg"; then
+    record_recent "$pkg"
+    return
+  fi
+  launch_lock "phonelink.$pkg" || return 0
 
   serial=$(pick_device direct) || exit 1
   mapfile -t wargs < <(window_args)
@@ -541,14 +639,19 @@ open_app() {
   audio_busy && args+=(--no-audio)
 
   spawn "phonelink.$pkg" "$name" "${args[@]}"
+  [[ -n ${PHONELINK_DRY_RUN:-} ]] && return
 
-  [[ -n ${PHONELINK_DRY_RUN:-} || -f "$DESKTOP_DIR/phonelink.$pkg.desktop" ]] ||
-    (write_entry "$pkg" "$name" true &>/dev/null &)
+  # Only an app that actually opened becomes recent.
+  wait_for_window "phonelink.$pkg" || return 0
+  record_recent "$pkg"
+  [[ -f "$DESKTOP_DIR/phonelink.$pkg.desktop" ]] ||
+    (exec {LAUNCH_LOCK}>&-; write_entry "$pkg" "$name" true &>/dev/null &)
 }
 
 mirror() {
   local serial label args wargs
   focus_class "phonelink" && return
+  launch_lock "phonelink" || return 0
 
   serial=$(pick_device direct) || exit 1
   label=$(device_label "$serial")
@@ -557,6 +660,7 @@ mirror() {
   audio_busy && args+=(--no-audio)
 
   spawn "phonelink" "$label" "${args[@]}"
+  wait_for_window "phonelink"
 }
 
 choose_app() {
@@ -623,14 +727,16 @@ pin_menu() {
 
 # ---------------------------------------------------------------- Wi-Fi
 
+# Waits for the phone just paired at $1 to connect, by its address or by the
+# mDNS name it announces from that address.
 wait_for_wireless() {
-  local ip=$1 addr _
+  local ip=$1 instance addr _
   for _ in {1..15}; do
-    if adb devices 2>/dev/null | awk '$2 == "device"' | grep -qE "_adb-tls-connect|^$ip:"; then
-      return 0
-    fi
-    addr=$(adb mdns services 2>/dev/null | awk -v ip="$ip:" '/_adb-tls-connect/ && index($NF, ip) == 1 { print $NF; exit }')
-    [[ -n $addr ]] && adb connect "$addr" &>/dev/null
+    ready_devices | awk -v p="$ip:" 'index($0, p) == 1 { found = 1 } END { exit !found }' && return 0
+    while read -r instance addr; do
+      ready_devices | grep -qxF "$instance._adb-tls-connect._tcp" && return 0
+      adb connect "$addr" &>/dev/null
+    done < <(adb mdns services 2>/dev/null | awk -v p="$ip:" '/_adb-tls-connect/ && index($NF, p) == 1 { print $1, $NF }')
     sleep 1
   done
   return 1
@@ -712,7 +818,7 @@ pair() {
 wifi() {
   local serial ip
   adb start-server &>/dev/null
-  serial=$(ready_devices | grep -vE ':|_adb-tls-connect' | head -1)
+  serial=$(ready_devices | usb_devices | head -1)
   [[ -n $serial ]] || die "Plug your phone in with USB first."
 
   ip=$(adb -s "$serial" shell ip -f inet addr show wlan0 2>/dev/null | awk '/inet / { sub(/\/.*/, "", $2); print $2; exit }')
@@ -728,19 +834,37 @@ wifi() {
   fi
 }
 
+connect() {
+  local serial
+  serial=$(pick_device) || exit 1
+  notify "Phone" "Connected to $(device_label "$serial")."
+}
+
 disconnect() {
-  local pid
-  # Close the phone windows phonelink opened, then drop every link. Stopping
-  # the adb server keeps it from reconnecting to the phone over mDNS; the next
-  # phonelink command starts it again.
+  local pid serial
+  # Close the phone windows phonelink opened, then drop the Wi-Fi links.
   for pid in $(pgrep -x scrcpy); do
     tr '\0' '\n' <"/proc/$pid/environ" 2>/dev/null | grep -q '^SDL_APP_ID=phonelink' && kill "$pid"
   done
   direct_disconnect
-  adb disconnect &>/dev/null
-  adb kill-server &>/dev/null
   rm -f "$TCP_FILE"
-  notify "Phone" "Disconnected. Open a phone app or the mirror to connect again."
+  adb_running || {
+    notify "Phone" "Disconnected."
+    return
+  }
+  for serial in $(ready_devices); do
+    [[ $serial == *:* || $serial == *_adb-tls-connect* ]] && adb disconnect "$serial" &>/dev/null
+  done
+
+  # While Wireless debugging is on, adb reconnects the phone by itself, and
+  # only stopping adb prevents that. Android Studio's emulators and USB devices
+  # share it, though, so it stays up while any of those are connected.
+  if [[ -z $(all_devices | usb_devices) ]]; then
+    adb kill-server &>/dev/null
+    notify "Phone" "Disconnected. Open a phone app or the mirror to connect again."
+  else
+    notify "Phone" "Phone windows closed and Wi-Fi links dropped. adb stays running for your USB devices and emulators, so the phone may reconnect while Wireless debugging is on."
+  fi
 }
 
 status() {
@@ -776,7 +900,7 @@ status_json() {
   if adb_running; then
     devices=$(ready_devices)
     if [[ -n $devices ]]; then
-      serial=$(grep -vE ':|_adb-tls-connect' <<<"$devices" | head -1)
+      serial=$(usb_devices <<<"$devices" | head -1)
       if [[ -n $serial ]]; then
         via=usb
       elif serial=$(direct_serial); then
@@ -830,6 +954,7 @@ open) require_tools; open_app "${1:?Usage: phonelink open <package>}" ;;
 mirror) require_tools; mirror ;;
 pin) require_tools; pin_menu ;;
 pair) require_tools; pair ;;
+connect) require_tools; connect ;;
 direct) require_tools; direct "${1:-on}" ;;
 wifi) require_tools; wifi ;;
 stop | disconnect) require_tools; disconnect ;;

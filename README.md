@@ -53,7 +53,13 @@ The installer adds any missing packages (`scrcpy`, `android-tools`,
 - adds a "Phone" entry to the app launcher
 - creates `~/.config/phonelink/config` for your settings
 
-Run it again after pulling to update.
+Run it again after pulling to update. An update replaces
+`~/.config/hypr/phonelink.lua` unless you've edited it; then your copy stays and
+the new one is saved beside it as `phonelink.lua.new`.
+
+If **Super + Alt + P** is already taken on your system, the installer says so.
+To keep your binding, set `phonelink_bindings = false` in
+`~/.config/hypr/hyprland.lua`, above the line that loads phonelink.
 
 ## Set up your phone
 
@@ -86,8 +92,8 @@ theme's accent color while a phone window is open.
 
 - **Left click** opens a panel with the phone's name and connection, a Mirror
   row, your recent and pinned apps with their icons, the Direct Wi-Fi link
-  switch, and Disconnect. Arrow keys or j/k move through it, Enter opens, Esc
-  closes.
+  switch, and Disconnect (or Connect and Pair when no phone is connected).
+  Arrow keys or j/k move through it, Enter opens, Esc closes.
 - **Right click** mirrors the phone.
 - **Middle click** opens the full app picker.
 
@@ -115,6 +121,7 @@ phonelink open <pkg>   Open one phone app in its own window
 phonelink mirror       Mirror and control the whole phone screen
 phonelink pin          Choose which phone apps appear in the app launcher
 phonelink pair         Pair over Wi-Fi with a QR code
+phonelink connect      Connect to a paired phone
 phonelink direct       Link straight to the phone with Wi-Fi Direct
 phonelink direct off   Drop the direct link
 phonelink stop         Close phone windows and drop all connections
@@ -128,6 +135,7 @@ phonelink status       Show connected phones
 | Setting | Default | |
 |---|---|---|
 | `DIRECT` | `auto` | Set to `off` to always go through the router |
+| `APP_ICONS` | `play` | Set to `off` to skip looking up app icons on Google Play (see Privacy) |
 | `APP_DPI` | `200` | Size of the UI in app windows; higher is bigger |
 | `KEYBOARD` | `uhid` | `uhid` gives the phone a real keyboard, so its own keyboard app handles languages such as Chinese |
 | `MIRROR_ARGS` | `(--max-size=1600)` | Extra scrcpy options for the mirror |
@@ -150,8 +158,22 @@ To float the mirror instead of tiling it, uncomment the last line of
   capture.
 - **Sound plays only in one window.** That's deliberate: only the first phone
   window forwards sound, so it doesn't play twice.
+- **Android emulators.** phonelink ignores them, so it never mirrors an emulator
+  by mistake. To use one anyway, set `SERIAL` to its name, such as
+  `emulator-5554`.
+- **Disconnect and Android Studio.** Disconnecting normally stops adb, because
+  that's the only way to keep it from reconnecting the phone while Wireless
+  debugging is on. If an emulator or a USB device is connected, adb stays up
+  for them, and the phone may reconnect.
 
 Each window's scrcpy log is in `~/.local/state/phonelink/logs/`.
+
+## Privacy
+
+Everything between your computer and phone stays on your network. The one
+exception is app icons: the first time you open or pin a phone app, phonelink
+fetches its icon from the app's Google Play page, which tells Google the app's
+package name. Set `APP_ICONS="off"` to use a generic icon instead.
 
 ## Uninstall
 

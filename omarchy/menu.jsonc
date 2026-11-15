@@ -1,4 +1,4 @@
-  // Android phone (phonelink, built on scrcpy).
+  // >>> phonelink >>> Android phone (built on scrcpy). Updated by its installer.
   "phone": {"icon":"󰄜","label":"Phone","aliases":["phonelink","android"],"description":"Use your Android phone"},
   "phone.apps": {"icon":"󰀻","label":"Open phone app","action":"phonelink apps"},
   "phone.mirror": {"icon":"󰍹","label":"Mirror screen","action":"phonelink mirror"},
@@ -7,5 +7,7 @@
   "phone.stop": {"icon":"󰅙","label":"Disconnect","description":"Close phone windows and drop all connections","action":"phonelink stop"},
   "phone.wireless": {"icon":"󰖩","label":"Wi-Fi"},
   "phone.wireless.direct": {"icon":"󱄙","label":"Direct link (faster)","description":"Wi-Fi Direct straight to the phone, skipping the router","when":"nmcli -t -f TYPE device 2>/dev/null | grep -qx wifi-p2p","checked":"nmcli -t -f NAME connection show --active | grep -qx phonelink-direct","action":"phonelink direct toggle"},
+  "phone.wireless.connect": {"icon":"󰌘","label":"Connect","description":"Find your paired phone over Wi-Fi or USB","action":"phonelink connect"},
   "phone.wireless.pair": {"icon":"󰐲","label":"Pair with QR code","description":"Android 11+, same Wi-Fi network","action":"phonelink pair"},
   "phone.wireless.usb": {"icon":"󰕓","label":"Switch USB phone to Wi-Fi","action":"phonelink wifi"},
+  // <<< phonelink <<<

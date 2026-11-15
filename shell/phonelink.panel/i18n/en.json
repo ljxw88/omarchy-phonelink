@@ -21,6 +21,8 @@
   "directBusy": "Setting up… keep the phone unlocked",
   "disconnect": "Disconnect",
   "disconnectCaption": "Close windows and drop the connection",
-  "pair": "Pair a phone",
+  "connect": "Connect",
+  "connectCaption": "Find your paired phone over Wi-Fi or USB",
+  "pair": "Pair a new phone",
   "pairCaption": "Over Wi-Fi with a QR code"
 }
