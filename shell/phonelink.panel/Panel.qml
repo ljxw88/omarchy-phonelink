@@ -145,14 +145,49 @@ Panel {
   }
   readonly property int firstTile: items.length - tiles.length
 
-  function isSelected(index) { return cursorActive && selectedIndex === index }
-  function select(index) {
-    cursorActive = true
-    selectedIndex = index
+  // The cursor stays on its item while the list changes under it (apps
+  // reorder, buttons come and go), found again by its key. When its item is
+  // gone, it takes whatever now stands in its place.
+  property int selectedIndex: 0
+  property string selectedKey: ""
+  property int selectedRow: 0
+  property int selectedCol: 0
+  property bool cursorActive: false
+
+  function itemKey(item) {
+    return item.kind === "app" ? "app:" + item.app.package : item.kind
   }
 
-  property int selectedIndex: 0
-  property bool cursorActive: false
+  function isSelected(index) { return cursorActive && selectedIndex === index }
+
+  function setCursor(index) {
+    var entry = items[index]
+    selectedIndex = index
+    selectedKey = entry ? itemKey(entry.item) : ""
+    selectedRow = entry ? entry.row : 0
+    selectedCol = entry ? entry.col : 0
+  }
+
+  function select(index) {
+    cursorActive = true
+    setCursor(index)
+  }
+
+  function findCursor() {
+    var i
+    for (i = 0; i < items.length; i++) {
+      if (itemKey(items[i].item) === selectedKey) {
+        setCursor(i)
+        return
+      }
+    }
+    var place = 0
+    for (i = 0; i < items.length; i++)
+      if (items[i].row < selectedRow || (items[i].row === selectedRow && items[i].col <= selectedCol)) place = i
+    setCursor(place)
+  }
+
+  onItemsChanged: findCursor()
 
   // The network map page, and the data it draws.
   property bool networkOpen: false
@@ -310,6 +345,24 @@ Panel {
     root.openNetwork()
   }
 
+  // Calls from outside go where the bar sends its own panels' hotkeys: to a
+  // copy that's open, else to the one on the monitor in focus.
+  function targetCopy() {
+    var focused = Hyprland.focusedMonitor ? String(Hyprland.focusedMonitor.name) : ""
+    var items = copies().filter(function(item) { return item && typeof item.openNetworkHere === "function" })
+    var open = items.filter(function(item) { return item.opened === true })
+    var pool = open.length > 0 ? open : items
+    for (var i = 0; i < pool.length; i++)
+      if (pool[i].screenName === focused) return pool[i]
+    return pool.length > 0 ? pool[0] : root
+  }
+
+  function closeAll() {
+    var items = copies()
+    for (var i = 0; i < items.length; i++)
+      if (items[i] && items[i].opened === true) items[i].close()
+  }
+
   function openNetwork() {
     networkOpen = true
     laneIndex = -1
@@ -429,24 +482,16 @@ Panel {
   ShellIpc {
     target: "phonelink.panel"
 
-    function open(): void { root.open() }
-    function close(): void { root.close() }
-    function show(): void { root.open() }
-    function hide(): void { root.close() }
-    function toggle(): void { root.toggle() }
-    // Opens on the monitor in focus. One copy of the widget handles the
-    // call for all of them, so it hands it to the right one.
-    function network(): void {
-      var focused = Hyprland.focusedMonitor ? String(Hyprland.focusedMonitor.name) : ""
-      var items = root.copies()
-      for (var i = 0; i < items.length; i++) {
-        if (items[i] && items[i].screenName === focused && typeof items[i].openNetworkHere === "function") {
-          items[i].openNetworkHere()
-          return
-        }
-      }
-      root.openNetworkHere()
+    function open(): void { root.targetCopy().open() }
+    function close(): void { root.closeAll() }
+    function show(): void { root.targetCopy().open() }
+    function hide(): void { root.closeAll() }
+    function toggle(): void {
+      var target = root.targetCopy()
+      if (target.opened) root.closeAll()
+      else target.open()
     }
+    function network(): void { root.targetCopy().openNetworkHere() }
   }
 
   // Left and right move along a row, up and down to the nearest item in the
@@ -459,7 +504,7 @@ Panel {
     }
     if (dx !== 0) {
       var next = selectedIndex + dx
-      if (next >= 0 && next < items.length && items[next].row === current.row) selectedIndex = next
+      if (next >= 0 && next < items.length && items[next].row === current.row) setCursor(next)
       return
     }
     var row = current.row + dy
@@ -474,7 +519,7 @@ Panel {
         best = i
       }
     }
-    if (best >= 0) selectedIndex = best
+    if (best >= 0) setCursor(best)
   }
 
   onOpenedChanged: {
@@ -483,11 +528,9 @@ Panel {
       return
     }
     cursorActive = false
-    selectedIndex = 0
+    setCursor(0)
     refresh(false)
   }
-
-  onItemsChanged: if (selectedIndex >= items.length) selectedIndex = Math.max(0, items.length - 1)
 
   // --- status ----------------------------------------------------------------
 
@@ -698,7 +741,7 @@ Panel {
       onTabRequested: function(direction) { root.switchPanel(direction) }
       onTextKey: function(t) {
         if (t === "m" || t === "M") root.activate({ kind: "mirror" })
-        else if ((t === "s" || t === "S") && root.cursorActive && root.items[root.selectedIndex]) root.toggleSound(root.items[root.selectedIndex].item)
+        else if ((t === "s" || t === "S") && !root.networkOpen && root.cursorActive && root.items[root.selectedIndex]) root.toggleSound(root.items[root.selectedIndex].item)
         else if (t === "n" || t === "N") root.networkOpen ? root.closeNetwork() : root.openNetwork()
       }
 
