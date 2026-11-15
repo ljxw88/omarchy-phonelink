@@ -15,7 +15,8 @@
 #                          Play a phone window's sound on this computer or the phone
 #   phonelink direct       Link straight to the phone with Wi-Fi Direct (faster)
 #   phonelink direct off   Drop the direct link
-#   phonelink wifi         Switch a USB-connected phone to Wi-Fi
+#   phonelink wifi         Switch a USB-connected phone to Wi-Fi (unencrypted port 5555)
+#   phonelink wifi off     Close port 5555 again
 #   phonelink stop         Close phone windows and drop all connections
 #   phonelink refresh      Re-read the app list from the phone
 #   phonelink status       Show connected phones
@@ -163,20 +164,28 @@ tile_size() {
 
 # ---------------------------------------------------------------- devices
 
-# adb, without phonelink's lock files. When its server isn't running, adb
-# starts one in the background, and that server would hold any lock it
-# inherited for as long as it runs: a window could never open again, or the
-# sound never come back. LAUNCH_LOCK, SOUND_LOCK and SESSION_LOCK are set
-# while held.
+# Closes phonelink's lock files in this subshell, before it runs something
+# that can outlive them. When its server isn't running, adb starts one in
+# the background, and that server would hold any lock it inherited for as
+# long as it runs: a window could never open again, or the sound never come
+# back. LAUNCH_LOCK, SOUND_LOCK, SESSION_LOCK and DIRECT_LOCK are set while
+# held.
+close_locks() {
+  [[ -n ${LAUNCH_LOCK:-} ]] && exec {LAUNCH_LOCK}>&-
+  [[ -n ${SOUND_LOCK:-} ]] && exec {SOUND_LOCK}>&-
+  [[ -n ${SESSION_LOCK:-} ]] && exec {SESSION_LOCK}>&-
+  [[ -n ${DIRECT_LOCK:-} ]] && exec {DIRECT_LOCK}>&-
+  return 0
+}
+
+# adb, without phonelink's lock files.
 adb() {
-  if [[ -z ${LAUNCH_LOCK:-}${SOUND_LOCK:-}${SESSION_LOCK:-} ]]; then
+  if [[ -z ${LAUNCH_LOCK:-}${SOUND_LOCK:-}${SESSION_LOCK:-}${DIRECT_LOCK:-} ]]; then
     command adb "$@"
     return
   fi
   (
-    [[ -n ${LAUNCH_LOCK:-} ]] && exec {LAUNCH_LOCK}>&-
-    [[ -n ${SOUND_LOCK:-} ]] && exec {SOUND_LOCK}>&-
-    [[ -n ${SESSION_LOCK:-} ]] && exec {SESSION_LOCK}>&-
+    close_locks
     exec adb "$@"
   )
 }
@@ -186,9 +195,7 @@ adb_timed() {
   local secs=$1
   shift
   (
-    [[ -n ${LAUNCH_LOCK:-} ]] && exec {LAUNCH_LOCK}>&-
-    [[ -n ${SOUND_LOCK:-} ]] && exec {SOUND_LOCK}>&-
-    [[ -n ${SESSION_LOCK:-} ]] && exec {SESSION_LOCK}>&-
+    close_locks
     exec timeout "$secs" adb "$@"
   )
 }
@@ -199,9 +206,17 @@ all_devices() {
 }
 
 # Phones only. Emulators belong to Android Studio, and one listed without an
-# address would otherwise pass for a phone on USB.
+# address would otherwise pass for a phone on USB. Nothing at a loopback
+# address is a phone either, and phone_id tells virtual machines such as
+# Waydroid apart, once per connection.
 ready_devices() {
-  all_devices | grep -v '^emulator-' || true
+  adb devices -l 2>/dev/null | awk -v ids="$IDS_FILE" '
+    BEGIN { while ((getline line < ids) > 0) { split(line, f, " "); vm[f[1] " " f[2]] = (f[3] == "(vm)") } }
+    NR > 1 && $2 == "device" && $1 !~ /^(emulator-|127\.|localhost:|\[::1\]:)/ {
+      t = ""
+      for (i = 3; i <= NF; i++) if ($i ~ /^transport_id:/) t = substr($i, 14)
+      if (!vm[$1 " " t]) print $1
+    }'
 }
 
 # Devices on USB have neither an address nor an mDNS name.
@@ -209,12 +224,104 @@ usb_devices() {
   grep -vE ':|_adb-tls-connect' || true
 }
 
+# adb's number for its connection to the device at serial $1. A new
+# connection gets a new number.
+transport_id() {
+  adb devices -l 2>/dev/null |
+    awk -v s="$1" '$1 == s { for (i = 3; i <= NF; i++) if ($i ~ /^transport_id:/) print substr($i, 14) }'
+}
+
+# A phone's identity is its serial number (ro.serialno), which also names its
+# Wireless debugging service: adb-<serial number>-<suffix>. Prints it for the
+# device adb reaches at serial $1, and fails for one that doesn't answer, has
+# none, or is an emulator or virtual machine. The answer is kept for the
+# connection only, since an address can lead to another device later. adb
+# counts its connections from 1 again when it restarts, so answers last until
+# logout, or until phonelink stops adb.
+IDS_FILE="${XDG_RUNTIME_DIR:-$STATE_DIR}/phonelink-ids"
+phone_id() {
+  local serial=$1 tid id tmp
+  tid=$(transport_id "$serial")
+  [[ -n $tid ]] || return 1
+  id=$(awk -v s="$serial" -v t="$tid" '$1 == s && $2 == t { print $3; exit }' "$IDS_FILE" 2>/dev/null)
+  if [[ -z $id ]]; then
+    id=$(adb_timed 4 -s "$serial" shell 'getprop ro.serialno; getprop ro.kernel.qemu; getprop ro.boot.qemu; getprop ro.hardware' \
+      </dev/null 2>/dev/null | tr -d '\r' | awk '
+        { line[NR] = $0 }
+        END {
+          if (NR < 4) exit 1
+          if (line[2] == "1" || line[3] == "1" || tolower(line[4]) ~ /ranchu|goldfish|waydroid/) { print "(vm)"; exit }
+          s = line[1]; gsub(/[^A-Za-z0-9]/, "", s)
+          print (s != "" ? s : "(none)")
+        }') || return 1
+    tmp=$(mktemp "$IDS_FILE.XXXXXX") || return 1
+    { awk -v s="$serial" '$1 != s' "$IDS_FILE" 2>/dev/null | tail -n 30; echo "$serial $tid $id"; } >"$tmp"
+    mv "$tmp" "$IDS_FILE"
+  fi
+  [[ $id != "(vm)" && $id != "(none)" ]] || return 1
+  printf '%s' "$id"
+}
+
+# The identity in a Wireless debugging service name.
+instance_id() {
+  local id=${1#adb-}
+  [[ $1 == adb-*-* ]] || return 1
+  id=${id%-*}
+  id=${id//[^A-Za-z0-9]/}
+  [[ -n $id ]] && printf '%s' "$id"
+}
+
+# The phones phonelink is used with, by identity. Until there's a list, the
+# phone whose video encoders it checked (hevc.<serial>) starts one, so a
+# phone already in use stays known.
+PHONES_FILE="$STATE_DIR/phones"
+known_phones() {
+  local f tmp
+  if [[ ! -e $PHONES_FILE ]]; then
+    tmp=$(mktemp "$PHONES_FILE.XXXXXX") || return 0
+    for f in "$STATE_DIR"/hevc.*; do
+      f=${f##*/hevc.}
+      [[ $f =~ ^[A-Za-z0-9]+$ && $f != unknown ]] && echo "$f"
+    done >"$tmp"
+    [[ -e $PHONES_FILE ]] || mv "$tmp" "$PHONES_FILE"
+    rm -f "$tmp"
+  fi
+  cat "$PHONES_FILE" 2>/dev/null
+  return 0
+}
+
+learn_phone() {
+  [[ -n ${1:-} ]] || return 0
+  known_phones | grep -qxF -- "$1" || echo "$1" >>"$PHONES_FILE"
+}
+
+# Whether to use the phone with identity $1: the one a window shows, while
+# there is one (WANT_PHONE), otherwise a known phone, or any phone while
+# none is known yet.
+WANT_PHONE=""
+phone_wanted() {
+  local known
+  [[ -n $1 ]] || return 1
+  if [[ -n $WANT_PHONE ]]; then
+    [[ $1 == "$WANT_PHONE" ]]
+    return
+  fi
+  known=$(known_phones)
+  [[ -z $known ]] || grep -qxF -- "$1" <<<"$known"
+}
+
 connect_wireless() {
-  local addr
-  # Phones with Wireless debugging on announce themselves over mDNS.
-  while read -r addr; do
-    [[ -n $addr ]] && adb_timed 4 connect "$addr" &>/dev/null
-  done < <(adb mdns services 2>/dev/null | awk '/_adb-tls-connect/ { print $NF }')
+  local name addr id known
+  # Phones with Wireless debugging on announce themselves over mDNS. So can
+  # anything else on the network, so only known phones get connected. adb
+  # connects the phones it's paired with by itself, a new one included.
+  known=$(known_phones)
+  if [[ -n $known ]]; then
+    while read -r name addr; do
+      id=$(instance_id "$name") && grep -qxF -- "$id" <<<"$known" || continue
+      adb_timed 4 connect "$addr" &>/dev/null
+    done < <(adb mdns services 2>/dev/null | awk '/_adb-tls-connect/ { print $1, $NF }')
+  fi
 
   # Phones switched to Wi-Fi with `phonelink wifi`.
   [[ -s $TCP_FILE ]] && adb_timed 4 connect "$(<"$TCP_FILE")" &>/dev/null
@@ -232,6 +339,17 @@ nearby_devices() {
     [[ -n $stale && $d == "$stale" ]] && continue
     echo "$d"
   done < <(ready_devices)
+}
+
+# Nearby connections other than USB. Port 5555 from `phonelink wifi` comes
+# last: unlike the phone's own Wireless debugging, it isn't encrypted.
+nearby_wireless() {
+  local list tcp=""
+  [[ -s $TCP_FILE ]] && tcp=$(<"$TCP_FILE")
+  list=$(nearby_devices | grep -E ':|_adb-tls-connect')
+  grep -vxF -- "$tcp" <<<"$list"
+  [[ -n $tcp ]] && grep -xF -- "$tcp" <<<"$list"
+  return 0
 }
 
 tailnet_devices() {
@@ -279,11 +397,49 @@ path_label() {
   esac
 }
 
+# The first of these connections that answers with a phone to use (see
+# phone_wanted). Drops dead ones on the way, unless a window still uses
+# them: a slow connection isn't necessarily dead, and dropping it would cut
+# that window too.
+first_answering() {
+  local c id
+  for c in "$@"; do
+    [[ -n $c ]] || continue
+    if ! phone_alive "$c"; then
+      serial_in_use "$c" || adb disconnect "$c" &>/dev/null
+      continue
+    fi
+    id=$(phone_id "$c") && phone_wanted "$id" || continue
+    printf '%s' "$c"
+    return 0
+  done
+  return 1
+}
+
+# The phone on USB to use: a known one, or else one phonelink doesn't know,
+# since someone plugged it in. That one comes with status 2, as a last
+# resort, and never while a window wants a particular phone.
+usb_phone() {
+  local c id other=""
+  for c in $(nearby_devices | usb_devices); do
+    id=$(phone_id "$c") || continue
+    if phone_wanted "$id"; then
+      printf '%s' "$c"
+      return 0
+    fi
+    [[ -n $other ]] || other=$c
+  done
+  [[ -n $other && -z $WANT_PHONE ]] || return 1
+  printf '%s' "$other"
+  return 2
+}
+
 # Prints the serial of the phone to use: USB first, then the direct Wi-Fi
 # link, then the router, then Tailscale, skipping any that don't answer.
-# With "direct", sets up the direct link if it's down.
+# Known phones come first; one phonelink doesn't know is used only on USB,
+# or as the first phone. With "direct", sets up the direct link if it's down.
 pick_device() {
-  local want_direct=${1:-} serial="" candidates=() c direct="" demoted=""
+  local want_direct=${1:-} serial="" other="" candidates=() fresh=() c id direct="" demoted="" scanned=false
   adb start-server &>/dev/null
 
   if [[ -n $SERIAL ]]; then
@@ -292,43 +448,46 @@ pick_device() {
       connect_wireless
     fi
     all_devices | grep -qxF "$SERIAL" || die "Phone $SERIAL isn't connected."
+    id=$(phone_id "$SERIAL") && learn_phone "$id"
     printf '%s' "$SERIAL"
     return
   fi
 
-  [[ -n $(nearby_devices) ]] || connect_wireless
-
-  serial=$(nearby_devices | usb_devices | head -1)
-  if [[ -n $serial ]]; then
-    learn_tailnet "$serial" &>/dev/null &
-    printf '%s' "$serial"
-    return
+  if [[ -z $(nearby_devices) ]]; then
+    connect_wireless
+    scanned=true
   fi
 
-  # A direct link on another channel than the Wi-Fi connection makes the
-  # Wi-Fi card switch back and forth, so the router goes first then.
-  if direct=$(direct_serial); then
-    if direct_mcc; then demoted=$direct; else candidates+=("$direct"); fi
-  fi
-  while read -r c; do
-    [[ -n $c && $c != "$direct" ]] && candidates+=("$c")
-  done < <(nearby_devices)
-  [[ -n $demoted ]] && candidates+=("$demoted")
-  while read -r c; do
-    [[ -n $c ]] && candidates+=("$c")
-  done < <(tailnet_devices)
+  serial=$(usb_phone)
+  (($? == 2)) && other=$serial serial=""
 
-  serial=""
-  for c in "${candidates[@]}"; do
-    if phone_alive "$c"; then
-      serial=$c
-      break
+  if [[ -z $serial ]]; then
+    # A direct link on another channel than the Wi-Fi connection makes the
+    # Wi-Fi card switch back and forth, so the router goes first then.
+    if direct=$(direct_serial); then
+      if direct_mcc; then demoted=$direct; else candidates+=("$direct"); fi
     fi
-    # Drop a dead connection, unless a window still uses it: a slow one
-    # isn't necessarily dead, and dropping it would cut that window too.
-    serial_in_use "$c" || adb disconnect "$c" &>/dev/null
-  done
+    while read -r c; do
+      [[ -n $c && $c != "$direct" ]] && candidates+=("$c")
+    done < <(nearby_wireless)
+    [[ -n $demoted ]] && candidates+=("$demoted")
+    while read -r c; do
+      [[ -n $c ]] && candidates+=("$c")
+    done < <(tailnet_devices)
+    serial=$(first_answering "${candidates[@]}")
+  fi
 
+  # What's listed can be left from before Wireless debugging moved to a new
+  # port, so look around again before going further.
+  if [[ -z $serial ]] && ! $scanned; then
+    connect_wireless
+    while read -r c; do
+      [[ -n $c ]] && ! printf '%s\n' "${candidates[@]}" | grep -qxF -- "$c" && fresh+=("$c")
+    done < <(nearby_wireless)
+    serial=$(first_answering "${fresh[@]}")
+  fi
+
+  [[ -n $serial ]] || serial=$other
   if [[ -z $serial ]] && connect_tailscale; then
     serial=$REMOTE_SERIAL
   fi
@@ -339,13 +498,19 @@ pick_device() {
     die "${REMOTE_ERROR:-No phone found · turn on Wireless debugging}"
   fi
 
+  # A phone plugged in, or the first one used, becomes known.
+  if [[ $(path_of "$serial") == usb || -z $(known_phones) ]] && id=$(phone_id "$serial"); then
+    learn_phone "$id"
+  fi
+
   case $(path_of "$serial") in
-  direct)
-    learn_tailnet "$serial" &>/dev/null &
+  usb | direct)
+    (close_locks; learn_tailnet "$serial" &>/dev/null &)
     ;;
   wifi)
-    learn_tailnet "$serial" &>/dev/null &
-    if [[ $want_direct == direct && $DIRECT == auto && -n $(p2p_device) ]] && direct_allowed; then
+    (close_locks; learn_tailnet "$serial" &>/dev/null &)
+    # Not while a direct link is up on another channel: the router is better then.
+    if [[ -z $demoted && $want_direct == direct && $DIRECT == auto && -n $(p2p_device) ]] && direct_allowed; then
       if direct=$(direct_connect_locked "$serial"); then
         printf '%s' "$direct"
         return
@@ -381,6 +546,14 @@ tailnet_peer() {
     jq -c --arg ip "$1" 'first(.Peer[]? | select(.TailscaleIPs | index($ip))) // empty'
 }
 
+# Android devices of this computer's own Tailscale user. A device shared into
+# the tailnet, or someone else's phone on it, isn't the phone. With an
+# address, only the device there.
+own_tailnet_phones() {
+  tailscale status --json 2>/dev/null | jq -c --arg ip "${1:-}" '.Self.UserID as $me
+    | .Peer[]? | select(.UserID == $me and .OS == "android" and ($ip == "" or (.TailscaleIPs | index($ip))))'
+}
+
 # While the phone is nearby, note its Tailscale address and its Wireless
 # debugging port, so it can be reached from elsewhere later. Mobile carriers
 # hand out addresses in Tailscale's range too, so only an address the tailnet
@@ -392,14 +565,14 @@ learn_tailnet() {
   [[ -s $TAILNET_FILE ]] && old=$(<"$TAILNET_FILE")
   [[ -n $port ]] || port=${old#* }
   while read -r ip; do
-    is_tailnet_ip "$ip" && [[ -n $(tailnet_peer "$ip") ]] || continue
+    is_tailnet_ip "$ip" && [[ -n $(own_tailnet_phones "$ip") ]] || continue
     [[ "$ip $port" == "$old" ]] || echo "$ip $port" >"$TAILNET_FILE"
     return 0
-  done < <(adb -s "$serial" shell ip -4 -o addr show 2>/dev/null | awk '{ sub(/\/.*/, "", $4); print $4 }')
+  done < <(adb_timed 10 -s "$serial" shell ip -4 -o addr show </dev/null 2>/dev/null | awk '{ sub(/\/.*/, "", $4); print $4 }')
 }
 
 # The phone's Tailscale address: the one set in TAILSCALE_HOST, the one it
-# reported while nearby, or the tailnet's only Android device.
+# reported while nearby, or your only Android device on the tailnet.
 tailnet_address() {
   local ip=""
   if [[ -n $TAILSCALE_HOST ]]; then
@@ -411,8 +584,7 @@ tailnet_address() {
   elif [[ -s $TAILNET_FILE ]]; then
     read -r ip _ <"$TAILNET_FILE"
   else
-    ip=$(tailscale status --json 2>/dev/null | jq -r '[.Peer[]? | select(.OS == "android")]
-      | if length == 1 then (.[0].TailscaleIPs[] | select(startswith("100."))) else empty end')
+    ip=$(own_tailnet_phones | jq -rs 'if length == 1 then (.[0].TailscaleIPs[] | select(startswith("100."))) else empty end')
   fi
   [[ -n $ip ]] && printf '%s' "$ip"
 }
@@ -428,12 +600,29 @@ adb_connect() {
   return 1
 }
 
+# Connects to the address $1, and keeps the connection only if the phone
+# with identity $2 answers there, or without $2, a phone to use (see
+# phone_wanted). Fails with 2 when some other device answers.
+connect_phone() {
+  local addr=$1 want=${2:-} id
+  adb_connect "$addr" || return 1
+  if id=$(phone_id "$addr"); then
+    if [[ -n $want ]]; then
+      [[ $id == "$want" ]] && return 0
+    else
+      phone_wanted "$id" && return 0
+    fi
+  fi
+  serial_in_use "$addr" || adb disconnect "$addr" &>/dev/null
+  return 2
+}
+
 # Reaches the phone over Tailscale. On success sets REMOTE_SERIAL; otherwise
 # sets REMOTE_ERROR to what the user can do about it.
 REMOTE_SERIAL=""
 REMOTE_ERROR=""
 connect_tailscale() {
-  local ip peer port="" p
+  local ip peer port="" p code other=false
   tailscale_enabled || return 1
   ip=$(tailnet_address) || return 1
   peer=$(tailnet_peer "$ip")
@@ -445,23 +634,35 @@ connect_tailscale() {
 
   [[ -s $TAILNET_FILE ]] && read -r _ port <"$TAILNET_FILE"
   for p in $port 5555; do
-    if adb_connect "$ip:$p"; then
+    connect_phone "$ip:$p"
+    code=$?
+    if ((code == 0)); then
       REMOTE_SERIAL="$ip:$p"
       return 0
     fi
+    ((code == 2)) && other=true
   done
 
   # Wireless debugging picks a new port each time it's turned on, and only
   # the phone's screen shows it.
-  if [[ -z ${PHONELINK_NO_PROMPT:-} ]] && command -v omarchy-menu-input &>/dev/null; then
+  if ! $other && [[ -z ${PHONELINK_NO_PROMPT:-} ]] && command -v omarchy-menu-input &>/dev/null; then
     p=$(omarchy-menu-input "Phone on Tailscale: turn on Wireless debugging, then enter the port it shows" --width 640) || p=""
-    if [[ $p =~ ^[0-9]+$ ]] && ((p > 0 && p < 65536)) && adb_connect "$ip:$p"; then
-      echo "$ip $p" >"$TAILNET_FILE"
-      REMOTE_SERIAL="$ip:$p"
-      return 0
+    if [[ $p =~ ^[0-9]+$ ]] && ((p > 0 && p < 65536)); then
+      connect_phone "$ip:$p"
+      code=$?
+      if ((code == 0)); then
+        echo "$ip $p" >"$TAILNET_FILE"
+        REMOTE_SERIAL="$ip:$p"
+        return 0
+      fi
+      ((code == 2)) && other=true
     fi
   fi
-  REMOTE_ERROR="Your phone is on Tailscale, but Wireless debugging didn't answer. Turn it on (the phone needs Wi-Fi), then run: phonelink connect <port shown on the phone>"
+  if $other; then
+    REMOTE_ERROR="Not your phone at $ip on Tailscale · set TAILSCALE_HOST"
+  else
+    REMOTE_ERROR="Your phone is on Tailscale, but Wireless debugging didn't answer. Turn it on (the phone needs Wi-Fi), then run: phonelink connect <port shown on the phone>"
+  fi
   return 1
 }
 
@@ -479,8 +680,10 @@ p2p_device() {
   nmcli -t -f DEVICE,TYPE device 2>/dev/null | awk -F: '$2 == "wifi-p2p" { print $1; exit }'
 }
 
+# Up means activated: a link NetworkManager is still setting up carries
+# nothing yet.
 direct_link_up() {
-  nmcli -t -f NAME connection show --active 2>/dev/null | grep -qxF "$DIRECT_CON"
+  [[ $(nmcli -g GENERAL.STATE connection show "$DIRECT_CON" 2>/dev/null) == activated ]]
 }
 
 # After a failed attempt, wait a while before trying again on every launch.
@@ -528,21 +731,48 @@ our_p2p_address() {
   iw dev 2>/dev/null | awk '$1 == "addr" { addr = $2 } $1 == "type" && $2 == "P2P-device" { print addr; exit }'
 }
 
+# The name this computer shows Wi-Fi Direct devices. NetworkManager announces
+# its wifi-p2p.device-name setting, or else the hostname, from version 1.60;
+# earlier versions announce none.
+our_p2p_name() {
+  local version name
+  version=$(nmcli -g VERSION general 2>/dev/null)
+  [[ $version =~ ^([0-9]+)\.([0-9]+) ]] || return 0
+  ((BASH_REMATCH[1] > 1 || BASH_REMATCH[2] >= 60)) || return 0
+  name=$(NetworkManager --print-config 2>/dev/null | sed -n 's/^wifi-p2p\.device-name=//p' | tail -1)
+  [[ -n $name ]] || name=$(uname -n)
+  printf '%s' "${name:0:32}"
+}
+
+# Whether the Wi-Fi Direct invitation the phone is asking about comes from
+# this computer (address $2): while Android asks, it keeps the requesting
+# device's address in mSavedPeerConfig.
+invited_by() {
+  local from
+  from=$(adb -s "$1" shell dumpsys wifip2p 2>/dev/null |
+    awk '/mSavedPeerConfig/ { found = 1 } found && $1 == "address:" { print $2; exit }' | tr -d '\r')
+  [[ -n $from && ${from,,} == "${2,,}" ]]
+}
+
 # Taps Connect on the phone's Wi-Fi Direct invitation, so the user needn't,
-# but only when the invitation comes from this computer: while Android asks,
-# it keeps the requesting device's address in mSavedPeerConfig.
+# but only when the invitation comes from this computer (address $2), and
+# the dialog names it, when it announces a name ($3). The invitation is
+# checked before the dialog is read and again right before the tap, in case
+# another came in meanwhile.
 accept_invitation() {
-  local serial=$1 ours=$2 xml node from x1 y1 x2 y2
-  [[ -n $ours ]] || return 1
+  local serial=$1 ours=$2 name=${3:-} xml node texts x1 y1 x2 y2
+  [[ -n $ours ]] && invited_by "$serial" "$ours" || return 1
   xml=$(adb -s "$serial" exec-out uiautomator dump /dev/tty 2>/dev/null)
   node=$(grep -oE '<node [^>]*resource-id="android:id/button1"[^>]*package="com\.android\.wifi\.dialog"[^>]*>' <<<"$xml" | head -1)
   [[ -n $node ]] || return 1
-
-  from=$(adb -s "$serial" shell dumpsys wifip2p 2>/dev/null |
-    awk '/mSavedPeerConfig/ { found = 1 } found && $1 == "address:" { print $2; exit }' | tr -d '\r')
-  [[ -n $from && ${from,,} == "${ours,,}" ]] || return 1
+  if [[ -n $name ]]; then
+    texts=$(grep -oE '<node [^>]*package="com\.android\.wifi\.dialog"[^>]*>' <<<"$xml" | grep -oE ' text="[^"]*"' |
+      sed -E 's/^ text="//; s/"$//; s/&lt;/</g; s/&gt;/>/g; s/&quot;/"/g; s/&apos;/'"'"'/g; s/&amp;/\&/g')
+    grep -qF -- "$name" <<<"$texts" || return 1
+  fi
 
   read -r x1 y1 x2 y2 < <(grep -oE 'bounds="[^"]*"' <<<"$node" | grep -oE '[0-9]+' | tr '\n' ' ')
+  invited_by "$serial" "$ours" || return 1
   adb -s "$serial" shell input tap $(((x1 + x2) / 2)) $(((y1 + y2) / 2)) &>/dev/null
 }
 
@@ -558,26 +788,49 @@ phone_locked() {
 }
 
 # Only one direct-link setup at a time. A second caller waits for the first,
-# then uses the link it made.
+# then uses the link it made, unless that's on another channel than the
+# Wi-Fi (see pick_device) or to another phone.
+DIRECT_LOCK=""
 direct_connect_locked() {
-  local serial=$1 lock result=""
-  exec {lock}>"$STATE_DIR/direct.lock"
-  if flock -w 120 "$lock"; then
-    result=$(direct_serial) || result=$(direct_connect "$serial") || result=""
+  local serial=$1 result=""
+  exec {DIRECT_LOCK}>"$STATE_DIR/direct.lock"
+  if flock -w 120 "$DIRECT_LOCK"; then
+    if result=$(direct_serial); then
+      if direct_mcc || [[ $(phone_id "$result") != "$(phone_id "$serial")" ]]; then
+        result=""
+      fi
+    else
+      result=$(direct_connect "$serial") || result=""
+    fi
   fi
-  exec {lock}>&-
+  exec {DIRECT_LOCK}>&-
+  DIRECT_LOCK=""
   [[ -n $result ]] && printf '%s' "$result"
 }
 
 # Links the laptop and the phone (reached as $1 over the router) with
 # Wi-Fi Direct, and prints the phone's adb serial over that link.
 direct_connect() {
-  local serial=$1 dev path port name known peer pid ok iface ip phone ours _
+  local serial=$1 dev path port id addr name known peer pid ok iface ip phone ours ours_name _
   dev=$(p2p_device)
   [[ -n $dev ]] || return 1
   path=$(nmcli -g GENERAL.DBUS-PATH device show "$dev" 2>/dev/null)
   port=$(adb_port "$serial")
-  [[ -n $path && -n $port ]] || return 1
+  id=$(phone_id "$serial")
+  [[ -n $path && -n $port && -n $id ]] || return 1
+
+  # Wireless debugging can move to another port while the link stays up, and
+  # then reconnecting on the new one is enough.
+  if direct_link_up && [[ -s $DIRECT_FILE ]]; then
+    addr=$(<"$DIRECT_FILE")
+    addr="${addr%:*}:$port"
+    if connect_phone "$addr" "$id"; then
+      echo "$addr" >"$DIRECT_FILE"
+      rm -f "$DIRECT_FAIL_FILE"
+      printf '%s' "$addr"
+      return 0
+    fi
+  fi
 
   adb -s "$serial" shell input keyevent KEYCODE_WAKEUP &>/dev/null
   if phone_locked "$serial"; then
@@ -591,8 +844,10 @@ direct_connect() {
 
   notify "Phone" "Linking directly… tap Connect if the phone asks"
   name=$(adb -s "$serial" shell settings get global device_name 2>/dev/null | tr -d '\r')
+  [[ $name == null ]] && name=""
   known=$(cat "$DIRECT_PEER_FILE" 2>/dev/null)
   ours=$(our_p2p_address)
+  ours_name=$(our_p2p_name)
 
   # Android only answers Wi-Fi Direct while its settings page is searching,
   # and only starts searching when the page opens fresh.
@@ -602,7 +857,8 @@ direct_connect() {
     StartFind 'a{sv}' 1 timeout i 40 &>/dev/null
 
   for _ in {1..40}; do
-    peer=$(p2p_peers "$path" | awk -F'\t' -v n="$name" -v m="${known,,}" '$2 == n || tolower($1) == m { print $1; exit }')
+    peer=$(p2p_peers "$path" | awk -F'\t' -v n="$name" -v m="${known,,}" \
+      '(n != "" && $2 == n) || (m != "" && tolower($1) == m) { print $1; exit }')
     [[ -n $peer ]] && break
     sleep 1
   done
@@ -610,7 +866,6 @@ direct_connect() {
     close_wifi_direct_page "$serial"
     return 1
   fi
-  echo "$peer" >"$DIRECT_PEER_FILE"
 
   if nmcli -t -f NAME connection show 2>/dev/null | grep -qxF "$DIRECT_CON"; then
     nmcli connection modify "$DIRECT_CON" wifi-p2p.peer "$peer" &>/dev/null
@@ -622,13 +877,15 @@ direct_connect() {
   nmcli --wait 45 connection up "$DIRECT_CON" &>/dev/null &
   pid=$!
   while kill -0 "$pid" 2>/dev/null; do
-    accept_invitation "$serial" "$ours" && break
+    accept_invitation "$serial" "$ours" "$ours_name" && break
     sleep 1
   done
   wait "$pid"
   ok=$?
   close_wifi_direct_page "$serial"
-  ((ok == 0)) || return 1
+  # NetworkManager carries on after nmcli gives up, and the link could come
+  # up later with nothing using it.
+  ((ok == 0)) || { direct_link_down; return 1; }
 
   # Android runs the link at .1 and hands the laptop an address. If the laptop
   # ended up running it instead, the phone is the neighbour that asked for one.
@@ -650,12 +907,16 @@ direct_connect() {
   fi
   [[ -n $phone ]] || { direct_link_down; return 1; }
 
+  # Whatever answers over the link has to be the phone it was made for.
   for _ in {1..5}; do
-    adb connect "$phone:$port" 2>/dev/null | grep -q "connected to" && break
+    connect_phone "$phone:$port" "$id"
+    ok=$?
+    ((ok == 1)) || break
     sleep 1
   done
-  ready_devices | grep -qxF "$phone:$port" || { direct_link_down; return 1; }
+  ((ok == 0)) || { direct_link_down; return 1; }
 
+  echo "$peer" >"$DIRECT_PEER_FILE"
   echo "$phone:$port" >"$DIRECT_FILE"
   rm -f "$DIRECT_FAIL_FILE"
   printf '%s' "$phone:$port"
@@ -687,7 +948,7 @@ direct_link_down() {
 }
 
 direct_disconnect() {
-  [[ -s $DIRECT_FILE ]] && adb disconnect "$(<"$DIRECT_FILE")" &>/dev/null
+  [[ -s $DIRECT_FILE ]] && adb_running && adb disconnect "$(<"$DIRECT_FILE")" &>/dev/null
   rm -f "$DIRECT_FILE"
   direct_link_down
 }
@@ -724,8 +985,8 @@ direct() {
 
 device_label() {
   local name
-  name=$(adb -s "$1" shell settings get global device_name 2>/dev/null | tr -d '\r')
-  [[ -z $name || $name == null ]] && name=$(adb -s "$1" shell getprop ro.product.model 2>/dev/null | tr -d '\r')
+  name=$(adb_timed 3 -s "$1" shell settings get global device_name 2>/dev/null | tr -d '\r')
+  [[ -z $name || $name == null ]] && name=$(adb_timed 3 -s "$1" shell getprop ro.product.model 2>/dev/null | tr -d '\r')
   printf '%s' "${name:-Phone}"
 }
 
@@ -1068,6 +1329,7 @@ sound_session() {
   local state="$STATE_DIR/session.$SOUND_ID.state"
 
   trap 'STOPPING=1; end_scrcpy' TERM INT HUP
+  WANT_PHONE=$(phone_id "$serial")
 
   while [[ -z $STOPPING ]]; do
     path=$(path_of "$serial")
@@ -1468,23 +1730,36 @@ build_args() {
   return 0
 }
 
-# A clearly better way to the phone than the current one, if it's already
-# connected: USB over anything, anything nearby over Tailscale.
+# A clearly better way to the same phone than the current one, if it's
+# already connected: USB over anything, anything nearby over Tailscale.
 better_path() {
-  local current=$1 now candidate=""
+  local current=$1 now want=$WANT_PHONE candidate=""
   [[ -z $SERIAL ]] || return 1
   now=$(path_of "$current")
   [[ $now == usb ]] && return 1
-  candidate=$(nearby_devices | usb_devices | head -1)
+  [[ -n $want ]] || want=$(phone_id "$current") || return 1
+  candidate=$(nearby_devices | usb_devices | first_of_phone "$want")
   if [[ -z $candidate && $now == tailscale ]]; then
-    candidate=$(direct_serial) || candidate=$(nearby_devices | head -1)
+    candidate=$({ direct_serial; echo; nearby_devices; } | first_of_phone "$want")
   fi
   [[ -n $candidate && $candidate != "$current" ]] && phone_alive "$candidate" || return 1
   printf '%s' "$candidate"
 }
 
+# The first of the serials read that reaches the phone with identity $1.
+first_of_phone() {
+  local c
+  while read -r c; do
+    [[ -n $c && $(phone_id "$c" </dev/null) == "$1" ]] || continue
+    printf '%s' "$c"
+    return 0
+  done
+  return 1
+}
+
 # Finds the phone again after a drop, whichever way works, for up to $1
-# seconds. Sets RECONNECT_SERIAL.
+# seconds: the same phone, while WANT_PHONE says which. Sets
+# RECONNECT_SERIAL.
 RECONNECT_SERIAL=""
 reconnect() {
   local deadline=$((SECONDS + $1)) pause=1 serial
@@ -1580,6 +1855,7 @@ session() {
   exec {SESSION_LOCK}>"$STATE_DIR/session.$app_id.lock"
   flock -n "$SESSION_LOCK" || exit 0
   trap 'STOPPING=1; end_scrcpy' TERM INT HUP
+  WANT_PHONE=$(phone_id "$serial")
 
   while [[ -z $STOPPING ]]; do
     path=$(path_of "$serial")
@@ -1902,31 +2178,37 @@ pin_menu() {
 # ---------------------------------------------------------------- Wi-Fi
 
 # Waits for the phone just paired at $1 to connect, by its address or by the
-# mDNS name it announces from that address.
+# mDNS name it announces from that address, and prints its serial.
 wait_for_wireless() {
-  local ip=$1 instance addr _
+  local ip=$1 instance addr serial _
   for _ in {1..15}; do
-    ready_devices | awk -v p="$ip:" 'index($0, p) == 1 { found = 1 } END { exit !found }' && return 0
-    while read -r instance addr; do
-      ready_devices | grep -qxF "$instance._adb-tls-connect._tcp" && return 0
-      adb connect "$addr" &>/dev/null
+    serial=$(ready_devices | awk -v p="$ip:" 'index($0, p) == 1 { print; exit }')
+    while [[ -z $serial ]] && read -r instance addr; do
+      ready_devices | grep -qxF "$instance._adb-tls-connect._tcp" && serial="$instance._adb-tls-connect._tcp"
+      [[ -n $serial ]] || adb connect "$addr" &>/dev/null
     done < <(adb mdns services 2>/dev/null | awk -v p="$ip:" '/_adb-tls-connect/ && index($NF, p) == 1 { print $1, $NF }')
+    if [[ -n $serial ]]; then
+      printf '%s' "$serial"
+      return 0
+    fi
     sleep 1
   done
   return 1
 }
 
 finish_pairing() {
-  local ip=$1 addr
+  local ip=$1 addr serial id
   echo
-  if ! wait_for_wireless "$ip"; then
+  if ! serial=$(wait_for_wireless "$ip"); then
     echo "Paired. Enter the address shown at the top of Wireless debugging."
     read -rp "IP address & port: " addr
     adb connect "$addr" | grep -q "connected to" || {
       echo "Couldn't connect to $addr."
       return 1
     }
+    serial=$addr
   fi
+  id=$(phone_id "$serial") && learn_phone "$id"
   echo -e "\e[32m✓ Connected\e[0m"
 }
 
@@ -1941,10 +2223,13 @@ pair_manual() {
 }
 
 adb_pair() {
-  local output
+  local output guid
   output=$(adb pair "$1" "$2" 2>&1)
   echo "$output"
-  grep -q "Successfully paired" <<<"$output"
+  grep -q "Successfully paired" <<<"$output" || return 1
+  # The phone gives its Wireless debugging name, which carries its identity.
+  guid=$(sed -n 's/.*\[guid=\([^]]*\)\].*/\1/p' <<<"$output")
+  learn_phone "$(instance_id "$guid")"
 }
 
 pair() {
@@ -1986,30 +2271,80 @@ pair() {
   return 1
 }
 
+# Switches the phone on USB to adb over Wi-Fi on port 5555, which reaches it
+# over Tailscale even on mobile data. Unlike Wireless debugging, port 5555
+# isn't encrypted, and it stays open until the phone restarts or
+# `phonelink wifi off`.
 wifi() {
-  local serial ip
+  local serial id ip c deadline
+  if [[ ${1:-} == off ]]; then
+    wifi_off
+    return
+  fi
   adb start-server &>/dev/null
-  serial=$(ready_devices | usb_devices | head -1)
+  serial=$(usb_phone)
   [[ -n $serial ]] || die "Plug your phone in with USB first."
+  id=$(phone_id "$serial")
+  learn_phone "$id"
+
+  # Switching restarts the phone's adb, which drops every connection to it,
+  # windows included, so not when it's on Wi-Fi already.
+  for c in $(nearby_wireless); do
+    [[ $(phone_id "$c") == "$id" ]] && phone_alive "$c" || continue
+    notify "Phone" "Already on Wi-Fi · unplug any time"
+    return 0
+  done
 
   ip=$(adb -s "$serial" shell ip -f inet addr show wlan0 2>/dev/null | awk '/inet / { sub(/\/.*/, "", $2); print $2; exit }')
   [[ -n $ip ]] || die "Your phone isn't on Wi-Fi."
 
   adb -s "$serial" tcpip 5555 &>/dev/null || die "Couldn't switch the phone to Wi-Fi."
-  sleep 2
-  if adb connect "$ip:5555" | grep -q "connected to"; then
-    echo "$ip:5555" >"$TCP_FILE"
-    notify "Phone on Wi-Fi" "Unplug any time · until the phone restarts"
-  else
-    die "Couldn't reach the phone at $ip."
+  deadline=$((SECONDS + 10))
+  until connect_phone "$ip:5555" "$id"; do
+    ((SECONDS < deadline)) || die "Couldn't reach the phone at $ip."
+    sleep 1
+  done
+  echo "$ip:5555" >"$TCP_FILE"
+  notify "Phone on Wi-Fi" "Unplug any time · until the phone restarts"
+}
+
+# Closes port 5555 again, on the phone reached through it or on USB. The
+# phone's adb restarts, so its other connections drop for a moment too.
+wifi_off() {
+  local tcp="" serial="" c id usb=false
+  adb start-server &>/dev/null
+  [[ -s $TCP_FILE ]] && tcp=$(<"$TCP_FILE")
+  [[ -n $tcp ]] && ! all_devices | grep -qxF "$tcp" && adb_connect "$tcp"
+  for c in $tcp $(ready_devices | grep ':5555$'); do
+    id=$(phone_id "$c") && phone_wanted "$id" && phone_alive "$c" || continue
+    serial=$c
+    break
+  done
+  if [[ -z $serial ]]; then
+    for c in $(ready_devices | usb_devices); do
+      phone_id "$c" >/dev/null || continue
+      usb=true
+      [[ $(adb_timed 3 -s "$c" shell getprop service.adb.tcp.port 2>/dev/null | tr -d '\r') == 5555 ]] || continue
+      serial=$c
+      break
+    done
   fi
+  if [[ -z $serial ]]; then
+    $usb || die "Plug your phone in with USB first."
+    rm -f "$TCP_FILE"
+    notify "Phone" "Port 5555 is already closed"
+    return
+  fi
+  adb_timed 5 -s "$serial" usb &>/dev/null || die "Couldn't close port 5555."
+  rm -f "$TCP_FILE"
+  notify "Phone" "Port 5555 closed"
 }
 
 # With no argument, finds the phone nearby or over Tailscale. With a port,
 # reaches it over Tailscale at that Wireless debugging port; with an
-# address and port, connects there.
+# address and port, connects there, and the phone there becomes known.
 connect() {
-  local target=${1:-} serial ip
+  local target=${1:-} serial ip id
   if [[ -z $target ]]; then
     serial=$(pick_device) || exit 1
   else
@@ -2021,6 +2356,7 @@ connect() {
     fi
     [[ $target =~ ^[A-Za-z0-9._-]+:[0-9]+$ ]] || die "Give a port, or an address and port such as 100.101.102.103:41234."
     adb_connect "$target" || die "Couldn't connect to $target. Check that Wireless debugging is on and shows that port."
+    id=$(phone_id "$target") && learn_phone "$id"
     is_tailnet_serial "$target" && echo "${target%:*} ${target##*:}" >"$TAILNET_FILE"
     serial=$target
   fi
@@ -2033,7 +2369,7 @@ connect() {
 }
 
 disconnect() {
-  local pid serial _
+  local pid serial tcp="" id _
   # End the sound connection, waiting for any change to it in progress, and
   # the window sessions, so neither reconnects. Then close any phone window
   # left, then drop the Wi-Fi links.
@@ -2052,11 +2388,17 @@ disconnect() {
     tr '\0' '\n' <"/proc/$pid/environ" 2>/dev/null | grep -q '^SDL_APP_ID=phonelink' && kill "$pid"
   done
   direct_disconnect
+  [[ -s $TCP_FILE ]] && tcp=$(<"$TCP_FILE")
   rm -f "$TCP_FILE"
   adb_running || {
     notify "Phone" "Disconnected."
     return
   }
+  # Port 5555 from `phonelink wifi` would stay open until the phone restarts,
+  # and closing it drops nothing that isn't being dropped anyway.
+  if [[ -n $tcp ]] && all_devices | grep -qxF "$tcp" && id=$(phone_id "$tcp") && phone_wanted "$id"; then
+    adb_timed 5 -s "$tcp" usb &>/dev/null
+  fi
   for serial in $(ready_devices); do
     [[ $serial == *:* || $serial == *_adb-tls-connect* ]] && adb disconnect "$serial" &>/dev/null
   done
@@ -2066,6 +2408,8 @@ disconnect() {
   # share it, though, so it stays up while any of those are connected.
   if [[ -z $(all_devices | usb_devices) ]]; then
     adb kill-server &>/dev/null
+    # A new server numbers its connections from 1 again (see phone_id).
+    rm -f "$IDS_FILE"
     notify "Phone" "Disconnected"
   else
     notify "Phone" "Disconnected · adb stays up for USB devices and emulators"
@@ -2601,7 +2945,7 @@ main() {
   connect) require_tools; connect "${1:-}" ;;
   direct) require_tools; direct "${1:-on}" ;;
   sound) require_tools; sound_cmd "${1:-toggle}" "${2:-}" ;;
-  wifi) require_tools; wifi ;;
+  wifi) require_tools; wifi "${1:-}" ;;
   stop | disconnect) require_tools; disconnect ;;
   doctor) require_tools; doctor ;;
   network)
