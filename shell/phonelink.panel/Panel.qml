@@ -102,7 +102,7 @@ Panel {
     : viaLabel
 
   readonly property string tooltip: connected || reconnecting
-    ? strings.t("tooltipConnected").arg(deviceName || strings.t("phone")).arg(statusLabel)
+    ? strings.t("tooltipConnected").arg(deviceName || strings.t("phone"), statusLabel)
     : strings.t("tooltipDisconnected")
 
   readonly property int columns: 4

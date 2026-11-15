@@ -82,9 +82,28 @@ mkdir -p "$STATE_DIR" "$LOG_DIR"
 
 # ---------------------------------------------------------------- helpers
 
+# App and device names in notifications come from the phone. Neither
+# notifier takes `--`, so text can't start with a dash, and the body is
+# markup, so it's escaped. Omarchy's notifications decode entities more than
+# once before letting a few tags back in, so a word joiner after each & and <
+# keeps escaped text from turning back into markup.
+notify_headline() {
+  printf '%s' "${1#"${1%%[!-]*}"}"
+}
+
+notify_body() {
+  local text=${1#"${1%%[!-]*}"} wj=$'\xe2\x81\xa0'
+  text=${text//&/"&amp;$wj"}
+  text=${text//</"&lt;$wj"}
+  printf '%s' "${text//>/"&gt;"}"
+}
+
 notify() {
-  omarchy-notification-send --app-name phonelink -g 󰄜 "$@" &>/dev/null ||
-    notify-send -a phonelink "$@" &>/dev/null || true
+  local opts=()
+  [[ ${1:-} == -u ]] && { opts=("$1" "$2"); shift 2; }
+  set -- "$(notify_headline "${1:-}")" "$(notify_body "${2:-}")"
+  omarchy-notification-send --app-name phonelink -g 󰄜 "${opts[@]}" "$@" &>/dev/null ||
+    notify-send -a phonelink "${opts[@]}" "$@" &>/dev/null || true
 }
 
 die() {
@@ -812,20 +831,25 @@ desktop_escape() {
 # App icons come from the app's Google Play page, which tells Google the
 # package name. APP_ICONS=off keeps a generic icon instead.
 fetch_icon() {
-  local pkg=$1 dest="$ICON_DIR/phonelink.$1.png" page url
+  local pkg=$1 dest="$ICON_DIR/phonelink.$1.png" page url tmp magic
   [[ $APP_ICONS == play ]] && valid_pkg "$pkg" || return 1
   [[ -s $dest ]] && return 0
   mkdir -p "$ICON_DIR"
 
-  page=$(curl -fsSL --max-time 10 --max-filesize 8000000 -A "Mozilla/5.0" \
+  page=$(curl -fsSL --proto =https --proto-redir =https --max-time 10 --max-filesize 8000000 -A "Mozilla/5.0" \
     "https://play.google.com/store/apps/details?id=$pkg&hl=en") || return 1
   url=$(grep -oE '<meta property="og:image" content="[^"]+"' <<<"$page" | head -1 | sed -E 's/.*content="([^"]+)"/\1/')
   [[ $url == https://* ]] || return 1
 
-  if curl -fsSL --max-time 10 --max-filesize 2000000 -o "$dest.tmp" "${url%=*}=s256-br30"; then
-    mv "$dest.tmp" "$dest"
+  # Only a PNG or JPEG goes in: the bar panel and the launcher load it.
+  tmp=$(mktemp "$ICON_DIR/.phonelink.$pkg.XXXXXX") || return 1
+  if curl -fsSL --proto =https --proto-redir =https --max-time 10 --max-filesize 2000000 -o "$tmp" "${url%=*}=s256-br30" &&
+    magic=$(head -c 8 "$tmp" | od -An -tx1 | tr -d ' \n') &&
+    [[ $magic == 89504e470d0a1a0a || $magic == ffd8ff* ]]; then
+    chmod 644 "$tmp"
+    mv "$tmp" "$dest"
   else
-    rm -f "$dest.tmp"
+    rm -f "$tmp"
     return 1
   fi
   gtk-update-icon-cache "$ICON_ROOT" &>/dev/null || true
@@ -1507,7 +1531,7 @@ reconnect() {
 NOTE_ID=0
 session_note() {
   local id
-  id=$(omarchy-notification-send --app-name phonelink -g 󰄜 -u "${3:-low}" -r "$NOTE_ID" -p "$1" "$2" 2>/dev/null) || {
+  id=$(omarchy-notification-send --app-name phonelink -g 󰄜 -u "${3:-low}" -r "$NOTE_ID" -p "$(notify_headline "$1")" "$(notify_body "$2")" 2>/dev/null) || {
     notify -u "${3:-low}" "$1" "$2"
     return 0
   }

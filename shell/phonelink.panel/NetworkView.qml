@@ -390,7 +390,7 @@ Column {
         text: modelData.sound ? view.catalog.t("chipSound") : modelData.title
         tip: modelData.sound
           ? view.catalog.t("streamSound").arg(view.pathName(modelData.path))
-          : view.catalog.t("streamLine").arg(modelData.title).arg(view.pathName(modelData.path)).arg(modelData.bitRate).arg(modelData.codec.toUpperCase())
+          : view.catalog.t("streamLine").arg(modelData.title, view.pathName(modelData.path), modelData.bitRate, modelData.codec.toUpperCase())
       }
     }
 
