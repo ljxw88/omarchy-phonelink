@@ -82,9 +82,28 @@ mkdir -p "$STATE_DIR" "$LOG_DIR"
 
 # ---------------------------------------------------------------- helpers
 
+# App and device names in notifications come from the phone. Neither
+# notifier takes `--`, so text can't start with a dash, and the body is
+# markup, so it's escaped. Omarchy's notifications decode entities more than
+# once before letting a few tags back in, so a word joiner after each & and <
+# keeps escaped text from turning back into markup.
+notify_headline() {
+  printf '%s' "${1#"${1%%[!-]*}"}"
+}
+
+notify_body() {
+  local text=${1#"${1%%[!-]*}"} wj=$'\xe2\x81\xa0'
+  text=${text//&/"&amp;$wj"}
+  text=${text//</"&lt;$wj"}
+  printf '%s' "${text//>/"&gt;"}"
+}
+
 notify() {
-  omarchy-notification-send --app-name phonelink -g 󰄜 "$@" &>/dev/null ||
-    notify-send -a phonelink "$@" &>/dev/null || true
+  local opts=()
+  [[ ${1:-} == -u ]] && { opts=("$1" "$2"); shift 2; }
+  set -- "$(notify_headline "${1:-}")" "$(notify_body "${2:-}")"
+  omarchy-notification-send --app-name phonelink -g 󰄜 "${opts[@]}" "$@" &>/dev/null ||
+    notify-send -a phonelink "${opts[@]}" "$@" &>/dev/null || true
 }
 
 die() {
@@ -812,20 +831,25 @@ desktop_escape() {
 # App icons come from the app's Google Play page, which tells Google the
 # package name. APP_ICONS=off keeps a generic icon instead.
 fetch_icon() {
-  local pkg=$1 dest="$ICON_DIR/phonelink.$1.png" page url
+  local pkg=$1 dest="$ICON_DIR/phonelink.$1.png" page url tmp magic
   [[ $APP_ICONS == play ]] && valid_pkg "$pkg" || return 1
   [[ -s $dest ]] && return 0
   mkdir -p "$ICON_DIR"
 
-  page=$(curl -fsSL --max-time 10 --max-filesize 8000000 -A "Mozilla/5.0" \
+  page=$(curl -fsSL --proto =https --proto-redir =https --max-time 10 --max-filesize 8000000 -A "Mozilla/5.0" \
     "https://play.google.com/store/apps/details?id=$pkg&hl=en") || return 1
   url=$(grep -oE '<meta property="og:image" content="[^"]+"' <<<"$page" | head -1 | sed -E 's/.*content="([^"]+)"/\1/')
   [[ $url == https://* ]] || return 1
 
-  if curl -fsSL --max-time 10 --max-filesize 2000000 -o "$dest.tmp" "${url%=*}=s256-br30"; then
-    mv "$dest.tmp" "$dest"
+  # Only a PNG or JPEG goes in: the bar panel and the launcher load it.
+  tmp=$(mktemp "$ICON_DIR/.phonelink.$pkg.XXXXXX") || return 1
+  if curl -fsSL --proto =https --proto-redir =https --max-time 10 --max-filesize 2000000 -o "$tmp" "${url%=*}=s256-br30" &&
+    magic=$(head -c 8 "$tmp" | od -An -tx1 | tr -d ' \n') &&
+    [[ $magic == 89504e470d0a1a0a || $magic == ffd8ff* ]]; then
+    chmod 644 "$tmp"
+    mv "$tmp" "$dest"
   else
-    rm -f "$dest.tmp"
+    rm -f "$tmp"
     return 1
   fi
   gtk-update-icon-cache "$ICON_ROOT" &>/dev/null || true
@@ -1507,7 +1531,7 @@ reconnect() {
 NOTE_ID=0
 session_note() {
   local id
-  id=$(omarchy-notification-send --app-name phonelink -g 󰄜 -u "${3:-low}" -r "$NOTE_ID" -p "$1" "$2" 2>/dev/null) || {
+  id=$(omarchy-notification-send --app-name phonelink -g 󰄜 -u "${3:-low}" -r "$NOTE_ID" -p "$(notify_headline "$1")" "$(notify_body "$2")" 2>/dev/null) || {
     notify -u "${3:-low}" "$1" "$2"
     return 0
   }
@@ -2101,7 +2125,7 @@ status() {
 usage() {
   sed -n '3p' "$SELF" | sed 's/^# //'
   echo
-  grep -E '^#   phonelink' "$SELF" | sed 's/^# //'
+  awk '/^#   phonelink/ { on = 1 } on && !/^#  / { exit } on { sub(/^# /, ""); print }' "$SELF"
 }
 
 # Checks for the adb server without starting it: starting it would reconnect
@@ -2197,7 +2221,7 @@ computer_facts() {
   {
     echo "name $(uname -n)"
     ip -4 -o addr show 2>/dev/null | awk '{ split($4, a, "/"); print "addr", $2, a[1], ($0 ~ / dynamic /) ? "dhcp" : "static" }'
-    ip -4 route show default 2>/dev/null | awk '{ for (i = 1; i < NF; i++) if ($i == "via") v = $(i + 1); else if ($i == "dev") d = $(i + 1); print "route", d, v }'
+    ip -4 route show default 2>/dev/null | awk '{ v = d = ""; for (i = 1; i < NF; i++) if ($i == "via") v = $(i + 1); else if ($i == "dev") d = $(i + 1); print "route", d, v }'
     [[ -n $wifi ]] && echo "wifi $wifi"
     [[ -n $wifi ]] && iw dev "$wifi" link 2>/dev/null | awk '
       $1 == "Connected" { print "bssid", $3 }
@@ -2205,10 +2229,10 @@ computer_facts() {
       $1 == "freq:" { print "freq", int($2) }
       $1 == "signal:" { print "signal", $2 }'
   } | jq -R -s '
-    split("\n") | map(select(length > 0)) as $l
+    split("\n") | map(select(length > 0) | gsub("[[:cntrl:]]"; "")) as $l
     | ($l | map(select(startswith("name "))) | first // "" | .[5:]) as $name
     | ($l | map(select(startswith("wifi "))) | first // "" | .[5:]) as $wifi
-    | ($l | map(select(startswith("route ")) | split(" ") | { (.[1]): .[2] }) | add // {}) as $routes
+    | ($l | map(select(startswith("route ")) | split(" ") | select((.[2] // "") != "") | { (.[1]): .[2] }) | add // {}) as $routes
     | {
         name: $name,
         wifiIface: $wifi,
@@ -2224,22 +2248,24 @@ computer_facts() {
 # The phone's model, name and IPv4 addresses, and its Wi-Fi link, in one
 # round trip, as JSON. Empty when it can't be asked.
 phone_facts() {
+  local out
   [[ -n $1 ]] || return 0
-  adb_timed 5 -s "$1" shell 'getprop ro.product.model; settings get global device_name; ip -4 -o addr show; cmd wifi status 2>/dev/null' 2>/dev/null |
-    tr -d '\r' | jq -R -s '
-      split("\n") as $l
-      | ($l | map(capture("^[0-9]+: (?<iface>[^ ]+) +inet (?<ip>[0-9.]+)/[0-9]+.*?(?<dyn> dynamic)?(?:\\\\| |$)")?) | map(select(.iface != "lo"))) as $addrs
-      | ($l | map(capture("SSID: \"(?<v>[^\"]*)\"")?) | first // null) as $ssid
-      | {
-          model: ($l[0] // ""),
-          name: (($l[1] // "") | if . == "null" then "" else . end),
-          interfaces: [ $addrs[] | { iface, ip, assigned: (if .dyn then "dhcp" else "static" end) } ],
-          ssid: ($ssid.v // null),
-          bssid: ($l | map(capture("BSSID: (?<v>[0-9a-fA-F:]{17})")?) | first // null | if . then .v else null end),
-          rssi: ($l | map(capture("RSSI: (?<v>-?[0-9]+)")?) | first // null | if . then (.v | tonumber) else null end),
-          freqMhz: ($l | map(capture("Frequency: (?<v>[0-9]+)")?) | first // null | if . then (.v | tonumber) else null end),
-          txMbps: ($l | map(capture("Calculated Tx *: *(?<v>[0-9]+)")?) | first // null | if . then (.v | tonumber) else null end)
-        }'
+  out=$(adb_timed 5 -s "$1" shell 'getprop ro.product.model; settings get global device_name; ip -4 -o addr show; cmd wifi status 2>/dev/null' 2>/dev/null | tr -d '\r')
+  [[ -n $out ]] || return 0
+  # Android prints the Wi-Fi name as it is, control characters included.
+  jq -R -s '
+    split("\n") | map(gsub("[[:cntrl:]]"; "")) as $l
+    | ($l | map(capture("^[0-9]+: (?<iface>[^ ]+) +inet (?<ip>[0-9.]+)/[0-9]+(?<rest>.*)")?) | map(select(.iface != "lo"))) as $addrs
+    | {
+        model: ($l[0] // ""),
+        name: (($l[1] // "") | if . == "null" then "" else . end),
+        interfaces: [ $addrs[] | { iface, ip, assigned: (if .rest | test(" dynamic( |$)") then "dhcp" else "static" end) } ],
+        ssid: ($l | map(capture("^Wifi is connected to \"(?<v>.*)\"$")?) | first // null | if . then .v else null end),
+        bssid: ($l | map(capture("BSSID: (?<v>[0-9a-fA-F:]{17})")?) | first // null | if . then .v else null end),
+        rssi: ($l | map(capture("RSSI: (?<v>-?[0-9]+)")?) | first // null | if . then (.v | tonumber) else null end),
+        freqMhz: ($l | map(capture("Frequency: (?<v>[0-9]+)")?) | first // null | if . then (.v | tonumber) else null end),
+        txMbps: ($l | map(capture("Calculated Tx *: *(?<v>[0-9]+)")?) | first // null | if . then (.v | tonumber | if . > 0 then . else null end) else null end)
+      }' <<<"$out"
 }
 
 # Prints "rtt-ms best-rtt-ms bytes-received" for the adb server's
@@ -2301,23 +2327,39 @@ window_facts() {
 # Every way this computer has to the phone, which one the windows use, the
 # addresses at both ends, and where each address came from, as JSON.
 network_json() {
-  local ready usb="" direct="" direct_up=false direct_supported=false wifi_serial="" tail_serial="" tail_ip="" tail_port=""
-  local any="" computer phone windows server host port peer ts_ip ts_self mdns c
+  local ready usb="" direct="" direct_addr="" direct_up=false direct_supported=false wifi_serial="" wifi_addr="" tail_serial="" tail_ip="" tail_port=""
+  local any="" computer phone windows server host port peer ts_ip ts_self mdns="" c addr debug_port=""
   local direct_stats=null wifi_stats=null tail_stats=null tail_found=null tail_peer=null port_found=null wifi_found=null
 
   if adb_running; then
     ready=$(ready_devices)
     usb=$(usb_devices <<<"$ready" | head -1)
-    [[ -s $DIRECT_FILE ]] && direct=$(<"$DIRECT_FILE")
+    mdns=$(adb mdns services 2>/dev/null | awk '/_adb-tls-connect/ { print $1, $NF }')
+    [[ -s $DIRECT_FILE ]] && direct_addr=$(<"$DIRECT_FILE")
     direct_link_up && direct_up=true
-    [[ -n $direct ]] && $direct_up && grep -qxF "$direct" <<<"$ready" || direct=""
+    [[ -n $direct_addr ]] && $direct_up && grep -qxF "$direct_addr" <<<"$ready" && direct=$direct_addr
+    # The direct link's connection is never the router's, even while it
+    # lingers after the link dropped.
     while read -r c; do
-      [[ -n $c && $c != "$direct" && $c != "$usb" ]] || continue
-      if is_tailnet_serial "$c"; then [[ -n $tail_serial ]] || tail_serial=$c; else [[ -n $wifi_serial ]] || wifi_serial=$c; fi
+      [[ -n $c && $c != "$usb" && $c != "$direct_addr" ]] || continue
+      if is_tailnet_serial "$c"; then
+        [[ -n $tail_serial ]] || tail_serial=$c
+      elif [[ -z $wifi_serial ]]; then
+        addr=$c
+        # An mDNS name stands for the address it announced. The phone
+        # announces itself over the direct link too, which isn't the router.
+        if [[ $c == *_adb-tls-connect* ]]; then
+          addr=$(awk -v n="${c%%._adb-tls-connect*}" '$1 == n { print $2 }' <<<"$mdns")
+          if [[ -n $addr ]]; then
+            addr=$(grep -vxF -- "$direct_addr" <<<"$addr" | head -1)
+            [[ -n $addr ]] || continue
+          fi
+        fi
+        wifi_serial=$c wifi_addr=$addr
+      fi
     done <<<"$ready"
     any=${usb:-${direct:-${wifi_serial:-$tail_serial}}}
     server=$(adb_server_pid)
-    mdns=$(adb mdns services 2>/dev/null | awk '/_adb-tls-connect/ { print $1, $NF }')
   fi
   [[ -n $(p2p_device) ]] && direct_supported=true
 
@@ -2326,18 +2368,17 @@ network_json() {
   [[ -n $phone ]] || phone=null
   windows=$(window_facts | jq -s '.')
 
-  # The router path: an mDNS name stands for the address it announced.
+  # The router path. An mDNS name no longer announced leaves its address
+  # unknown.
   if [[ -n $wifi_serial ]]; then
-    read -r host port < <(transport_of "$wifi_serial")
-    [[ -n $host ]] && wifi_stats=$(link_json "$host" "$port" "$server")
-    if [[ $wifi_serial == *_adb-tls-connect* ]] || grep -q " $host:$port\$" <<<"$mdns"; then
+    [[ $wifi_addr =~ ^[0-9.]+:[0-9]+$ ]] && wifi_stats=$(link_json "${wifi_addr%:*}" "${wifi_addr##*:}" "$server")
+    if [[ $wifi_serial == *_adb-tls-connect* ]] || cut -d' ' -f2 <<<"$mdns" | grep -qxF -- "$wifi_addr"; then
       wifi_found='"mdns"'
     elif [[ -s $TCP_FILE && $(<"$TCP_FILE") == "$wifi_serial" ]]; then
       wifi_found='"tcpip"'
     else
       wifi_found='"connected"'
     fi
-    wifi_serial="$host:$port"
   fi
   if [[ -n $direct ]]; then
     read -r host port < <(transport_of "$direct")
@@ -2369,18 +2410,21 @@ network_json() {
   fi
 
   # Wireless debugging listens on one port on every network the phone is on.
-  for c in "$wifi_serial" "$direct" "$tail_serial"; do
+  for c in "$wifi_addr" "$direct" "$tail_serial"; do
     [[ $c == *:* ]] || continue
-    port=${c##*:}
-    if grep -q ":$port\$" <<<"$mdns"; then port_found='"mdns"'; elif [[ $port == 5555 ]]; then port_found='"tcpip"'; else port_found='"remembered"'; fi
+    debug_port=${c##*:}
+    if grep -q ":$debug_port\$" <<<"$mdns"; then port_found='"mdns"'; elif [[ $debug_port == 5555 ]]; then port_found='"tcpip"'; else port_found='"remembered"'; fi
     break
   done
 
+  # Without a connection of its own, the router path shows the phone's
+  # address on the Wi-Fi with that port.
   jq -n \
     --argjson computer "$computer" --argjson phone "$phone" --argjson windows "$windows" \
     --arg usb "$usb" --arg direct "$direct" --argjson directUp "$direct_up" --argjson directSupported "$direct_supported" \
     --argjson directMcc "$(direct_mcc && echo true || echo false)" \
-    --arg wifi "$wifi_serial" --arg tail "${tail_ip:+$tail_ip${tail_port:+:$tail_port}}" --argjson tailConnected "$([[ -n $tail_serial ]] && echo true || echo false)" \
+    --arg wifi "$wifi_addr" --argjson wifiConnected "$([[ -n $wifi_serial ]] && echo true || echo false)" --arg debugPort "$debug_port" \
+    --arg tail "${tail_ip:+$tail_ip${tail_port:+:$tail_port}}" --argjson tailConnected "$([[ -n $tail_serial ]] && echo true || echo false)" \
     --arg tsSelf "${ts_self:-}" --argjson tailPeer "$tail_peer" --argjson tailFound "$tail_found" \
     --argjson wifiFound "$wifi_found" --argjson portFound "$port_found" \
     --argjson directStats "$direct_stats" --argjson wifiStats "$wifi_stats" --argjson tailStats "$tail_stats" '
@@ -2406,8 +2450,8 @@ network_json() {
             phone: (if $direct != "" then $direct elif $pp then $pp.ip else null end),
             computer: ($cp.ip // null), found: (if $direct != "" or $pp then "direct-owner" else null end),
             otherChannel: $directMcc, link: $directStats },
-          { kind: "wifi", state: state("wifi"; $wifi != ""; ($pw != null and $cw != null)),
-            phone: (if $wifi != "" then $wifi elif $pw then $pw.ip else null end), computer: ($cw.ip // null),
+          { kind: "wifi", state: state("wifi"; $wifiConnected; ($pw != null and $cw != null)),
+            phone: (if $wifi != "" then $wifi elif $pw then $pw.ip + (if $debugPort != "" then ":" + $debugPort else "" end) else null end), computer: ($cw.ip // null),
             assigned: { phone: ($pw.assigned // null), computer: ($cw.assigned // null) },
             found: ($wifiFound // (if $pw then "phone" else null end)), link: $wifiStats },
           { kind: "tailscale", state: state("tailscale"; $tailConnected; ($tail != "" and ($tailPeer.online // false))),
@@ -2422,6 +2466,8 @@ network_json() {
 network_text() {
   local json
   json=$(network_json)
+  # Names come from the phone and the network, so control characters in them
+  # never reach the terminal.
   jq -r '
     def pad($n): tostring | . + (" " * ([$n - length, 0] | max));
     def pathname: {usb: "USB", direct: "Direct link", wifi: "Wi-Fi", tailscale: "Tailscale"}[.];
@@ -2439,15 +2485,17 @@ network_text() {
         + (if .peer and .peer.online == false then " The phone is offline on Tailscale." elif .peer.direct then " Direct path: \(.peer.direct)." elif .peer.active then " Relayed through \(.peer.relay)." else "" end)
       end;
     def state_text: {active: "in use", connected: "connected", available: "available", off: "not connected", unsupported: "not supported here"}[.];
-    "This computer: \(.computer.name)" + (if .computer.ssid then " on \(.computer.ssid)" else "" end),
-    "Phone: " + (if .phone then "\(.phone.name) (\(.phone.model))" + (if .phone.ssid then " on \(.phone.ssid)" else "" end) else "not reachable right now" end),
+    def device: if (.name // "") == "" then .model elif (.model // "") == "" then .name else "\(.name) (\(.model))" end;
+    ("This computer: \(.computer.name)" + (if .computer.ssid then " on \(.computer.ssid)" else "" end),
+    "Phone: " + (if .phone then (.phone | device) + (if .phone.ssid then " on \(.phone.ssid)" else "" end) else "not reachable right now" end),
     "",
     (.paths[] |
       "\(.state | mark) \(.kind | pathname | pad(12)) \((.computer // "") | pad(16)) \(.state | line) \((.phone // "") | pad(22)) \(.state | state_text)\(stats)",
       (if .state == "off" or .state == "unsupported" then empty else "  " + (" " * 12) + " \(where)" end)),
-    (if .router then "", "Router: \(.router.ip)" + (if .router.sameAccessPoint == false then " · the phone and this computer use different access points" else "" end) else empty end),
+    (if .router then "", "Router: \(.router.ip)" + (if .router.sameAccessPoint == false then " · the phone and this computer connect to it on different bands or access points" else "" end) else empty end),
     (if .phone.mobile then "Also on the phone: mobile data \(.phone.mobile), from your carrier. Not reachable from here." else empty end),
-    (if (.windows | length) > 0 then "", "Streams:", (.windows[] | if .sound then "  Phone sound · \(.path | pathname)" else "  \(.title) · \(.path | pathname) · \(.bitRate)bit/s · \(.codec | ascii_upcase)" end) else empty end)
+    (if (.windows | length) > 0 then "", "Streams:", (.windows[] | if .sound then "  Phone sound · \(.path | pathname)" else "  \(.title) · \(.path | pathname) · \(.bitRate)bit/s · \(.codec | ascii_upcase)" end) else empty end))
+    | gsub("[[:cntrl:]]"; "")
   ' <<<"$json"
 }
 
@@ -2455,8 +2503,10 @@ network_text() {
 
 # Checks the usual causes of lag and dropouts, and says what to do about each.
 doctor() {
-  local serial="" path="" wifi link freq signal bssid ps con st rssi tx pfreq pbssid serialno hevc decode k t
-  say() { printf '  %s %s\n' "$1" "$2"; }
+  local serial="" path="" wifi link freq signal bssid ps con st rssi tx pfreq pbssid serialno hevc decode log newest="" k t
+  # Names come from the phone and the network, so control characters in them
+  # never reach the terminal.
+  say() { printf '  %s %s\n' "$1" "${2//[[:cntrl:]]/}"; }
 
   echo "Phone"
   adb start-server &>/dev/null
@@ -2489,8 +2539,9 @@ doctor() {
     ps=$(iw dev "$wifi" get power_save 2>/dev/null | awk '{ print $NF }')
     if [[ $ps == on ]]; then
       con=$(nmcli -t -f NAME,DEVICE connection show --active 2>/dev/null | awk -F: -v d="$wifi" '$2 == d { print $1; exit }')
+      con=$(printf '%q' "$con")
       say "!" "Wi-Fi power saving is on, a common cause of lag spikes. To turn it off:"
-      echo "      nmcli connection modify \"$con\" 802-11-wireless.powersave 2 && nmcli connection up \"$con\""
+      echo "      nmcli connection modify $con 802-11-wireless.powersave 2 && nmcli connection up $con"
     else
       say "✓" "Wi-Fi power saving is off"
     fi
@@ -2498,32 +2549,37 @@ doctor() {
     say "✓" "Not on Wi-Fi"
   fi
 
-  if [[ -n $serial && $path != usb ]]; then
+  # Older Android has no `cmd wifi status`, and then nothing is said.
+  [[ -n $serial && $path != usb ]] && st=$(adb -s "$serial" shell cmd wifi status 2>/dev/null | tr -d '\r')
+  if [[ ${st:-} == *"Wifi is connected"* ]]; then
     echo
     echo "The phone's Wi-Fi"
-    st=$(adb -s "$serial" shell cmd wifi status 2>/dev/null | tr -d '\r')
-    if grep -q "Wifi is connected" <<<"$st"; then
-      rssi=$(grep -oE 'RSSI: -?[0-9]+' <<<"$st" | head -1 | grep -oE -- '-?[0-9]+$')
-      tx=$(grep -oE 'Calculated Tx *: *[0-9]+' <<<"$st" | head -1 | grep -oE '[0-9]+$')
-      pfreq=$(grep -oE 'Frequency: [0-9]+' <<<"$st" | head -1 | grep -oE '[0-9]+$')
-      pbssid=$(grep -oE 'BSSID: [0-9a-fA-F:]{17}' <<<"$st" | head -1 | awk '{ print $2 }')
-      if [[ -n $rssi ]]; then
-        if ((rssi < -70)); then say "!" "Weak signal ($rssi dBm), which slows its uplink."; else say "✓" "Signal $rssi dBm"; fi
-      fi
-      if [[ -n $tx ]]; then
-        if ((tx < 25)); then
-          say "!" "Its Wi-Fi uplink carries about $tx Mbit/s, so phonelink keeps the video light."
-        else
-          say "✓" "Uplink about $tx Mbit/s"
-        fi
-      fi
-      [[ -n $pfreq ]] && ((pfreq < 3000)) && say "!" "On 2.4 GHz. Its 5 GHz network would be faster."
-      if [[ $path != tailscale && -n $pbssid && -n ${bssid:-} && ${pbssid,,} != "${bssid,,}" ]]; then
-        say "!" "The phone and this computer use different access points, so video crosses between them. Fine over a wired mesh, slower over a wireless one."
-      fi
-    else
-      say "!" "The phone isn't on Wi-Fi. Android turns Wireless debugging off without it."
+    rssi=$(grep -oE 'RSSI: -?[0-9]+' <<<"$st" | head -1 | grep -oE -- '-?[0-9]+$')
+    tx=$(grep -oE 'Calculated Tx *: *[0-9]+' <<<"$st" | head -1 | grep -oE '[0-9]+$')
+    pfreq=$(grep -oE 'Frequency: [0-9]+' <<<"$st" | head -1 | grep -oE '[0-9]+$')
+    pbssid=$(grep -oE 'BSSID: [0-9a-fA-F:]{17}' <<<"$st" | head -1 | awk '{ print $2 }')
+    if [[ -n $rssi ]]; then
+      if ((rssi < -70)); then say "!" "Weak signal ($rssi dBm), which slows its uplink."; else say "✓" "Signal $rssi dBm"; fi
     fi
+    # Only some phones (Samsung's) estimate their uplink.
+    if [[ -n $tx ]] && ((tx > 0)); then
+      if ((tx < 25)); then
+        say "!" "Its Wi-Fi uplink carries about $tx Mbit/s, so phonelink keeps the video light."
+      else
+        say "✓" "Uplink about $tx Mbit/s"
+      fi
+    fi
+    [[ -n $pfreq ]] && ((pfreq < 3000)) && say "!" "On 2.4 GHz. Its 5 GHz network would be faster."
+    # Only video through the router crosses between access points. A router
+    # has another BSSID on each band, so only BSSIDs on one band tell of two.
+    if [[ $path == wifi && -n $pbssid && -n ${bssid:-} && ${pbssid,,} != "${bssid,,}" && -n $pfreq && -n ${freq:-} ]] &&
+      (((pfreq < 3000 ? 2 : pfreq < 5925 ? 5 : 6) == (freq < 3000 ? 2 : freq < 5925 ? 5 : 6))); then
+      say "!" "The phone and this computer may use different access points, so video crosses between them. Fine over a wired mesh, slower over a wireless one."
+    fi
+  elif [[ ${st:-} == *"Wifi is not connected"* || ${st:-} == *"Wifi is disabled"* ]]; then
+    echo
+    echo "The phone's Wi-Fi"
+    say "!" "The phone isn't on Wi-Fi. Android turns Wireless debugging off without it."
   fi
 
   echo
@@ -2561,7 +2617,11 @@ doctor() {
     *) say "✓" "The phone's encoders get checked when the next window opens" ;;
     esac
   fi
-  decode=$(grep -h "Video decoding:" "$LOG_DIR"/*.log 2>/dev/null | tail -1 | awk '{ print $NF }')
+  # The newest window's log says how this computer decodes now.
+  for log in "$LOG_DIR"/*.log; do
+    grep -qs "Video decoding:" "$log" && [[ -z $newest || $log -nt $newest ]] && newest=$log
+  done
+  decode=$( [[ -n $newest ]] && grep -h "Video decoding:" "$newest" | tail -1 | awk '{ print $NF }')
   case $decode in
   "") ;;
   software) say "!" "This computer decodes the video in software. Installing your GPU's VA-API driver (libva-mesa-driver, intel-media-driver or nvidia-vaapi-driver) takes the load off the CPU." ;;

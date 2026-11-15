@@ -7,7 +7,7 @@ import qs.Commons as Commons
 // between the two, with the addresses at both ends. Where those addresses
 // came from shows on hover, or under a lane picked with the keyboard. Video
 // travels from the phone to this computer, so traffic on the lane in use
-// flows right to left.
+// flows toward this computer. Right-to-left languages read it mirrored.
 Column {
   id: view
 
@@ -89,13 +89,13 @@ Column {
       if (path.state === "unsupported") parts.push(catalog.t("whereDirectUnsupported"))
       else if (!path.phone) parts.push(catalog.t("whereDirectOff"))
       else {
-        parts.push(catalog.t("whereDirect").arg(path.computer || catalog.t("thisComputer")))
+        parts.push(path.computer ? catalog.t("whereDirect").arg(path.computer) : catalog.t("whereDirectOwner"))
         if (path.otherChannel) parts.push(catalog.t("whereDirectChannel"))
       }
     } else if (path.kind === "wifi") {
       if (!path.phone) parts.push(catalog.t("whereWifiOff"))
       else {
-        parts.push(catalog.t("whereWifi").arg(network.router ? network.router.ip : catalog.t("yourRouter")))
+        parts.push(network.router && network.router.ip ? catalog.t("whereWifi").arg(network.router.ip) : catalog.t("whereWifiRouter"))
         if (path.found === "mdns") parts.push(catalog.t("whereWifiMdns"))
         else if (path.found === "tcpip") parts.push(catalog.t("whereWifiTcpip"))
         else if (path.found === "phone") parts.push(catalog.t("whereWifiPhone"))
@@ -118,7 +118,7 @@ Column {
 
   // The node in the middle of a lane, if it passes through one.
   function middleText(path) {
-    if (path.kind === "wifi" && network.router) return catalog.t("router").arg(network.router.ip)
+    if (path.kind === "wifi" && network.router && network.router.ip) return catalog.t("router").arg(network.router.ip)
     if (path.kind === "tailscale" && path.peer) {
       if (path.peer.direct) return catalog.t("tailscaleDirectShort")
       if (path.peer.active && path.peer.relay) return catalog.t("tailscaleRelayShort").arg(path.peer.relay)
@@ -126,8 +126,11 @@ Column {
     return ""
   }
 
+  // Left alignment that's set, not implied, mirrors with the layout in
+  // right-to-left languages, even for addresses and other left-to-right text.
   component Label: Text {
     textFormat: Text.PlainText
+    horizontalAlignment: Text.AlignLeft
     color: view.foreground
     font.family: view.fontFamily
     font.pixelSize: Style.font.body
@@ -169,7 +172,7 @@ Column {
         anchors.verticalCenter: rightGlyph.verticalCenter
         width: parent.width - rightGlyph.width - parent.spacing
         horizontalAlignment: Text.AlignRight
-        text: view.phone ? view.phone.name : "–"
+        text: view.phone ? (view.phone.name || view.phone.model || view.catalog.t("phone")) : "–"
         font.bold: true
       }
     }
@@ -223,6 +226,7 @@ Column {
           implicitHeight: Math.max(name.implicitHeight, status.implicitHeight)
           Row {
             id: name
+            anchors.left: parent.left
             spacing: Style.space(6)
             Label {
               text: view.pathGlyph(lane.modelData.kind)
@@ -255,7 +259,7 @@ Column {
           readonly property real length: width - 2 * dot
 
           Rectangle {
-            x: 0
+            anchors.left: parent.left
             anchors.verticalCenter: parent.verticalCenter
             width: wire.dot
             height: wire.dot
@@ -265,7 +269,7 @@ Column {
             border.color: lane.wireColor
           }
           Rectangle {
-            x: wire.width - wire.dot
+            anchors.right: parent.right
             anchors.verticalCenter: parent.verticalCenter
             width: wire.dot
             height: wire.dot
@@ -278,37 +282,43 @@ Column {
           // Solid while connected, dashed while only possible.
           Rectangle {
             visible: lane.linked
-            x: wire.start
+            anchors.left: parent.left
+            anchors.leftMargin: wire.start
             width: wire.length
             anchors.verticalCenter: parent.verticalCenter
             height: lane.live ? 2 : 1
             color: lane.wireColor
             opacity: lane.live ? 1 : 0.7
           }
-          Repeater {
-            model: lane.modelData.state === "available" ? Math.max(0, Math.floor(wire.length / Style.space(8))) : 0
-            Rectangle {
-              required property int index
-              x: wire.start + index * Style.space(8)
-              anchors.verticalCenter: parent.verticalCenter
-              width: Style.space(4)
-              height: 1
-              color: view.foreground
-              opacity: 0.5
+          Row {
+            anchors.left: parent.left
+            anchors.leftMargin: wire.start
+            anchors.verticalCenter: parent.verticalCenter
+            spacing: Style.space(4)
+            Repeater {
+              model: lane.modelData.state === "available" ? Math.max(0, Math.floor(wire.length / Style.space(8))) : 0
+              Rectangle {
+                width: Style.space(4)
+                height: 1
+                color: view.foreground
+                opacity: 0.5
+              }
             }
           }
 
-          // Traffic on the lane in use, from the phone to this computer.
+          // Traffic on the lane in use, from the phone to this computer:
+          // right to left, or left to right where the map is mirrored.
           Repeater {
             model: lane.live && view.flowing ? 3 : 0
             Rectangle {
               required property int index
               readonly property real t: (view.phase + index / 3) % 1
+              readonly property real travel: wire.length - width
               width: Style.space(5)
               height: width
               radius: width / 2
               color: view.accent
-              x: wire.start + (1 - t) * (wire.length - width)
+              x: wire.start + (LayoutMirroring.enabled ? t : 1 - t) * travel
               anchors.verticalCenter: parent.verticalCenter
               opacity: Math.min(1, Math.min(t, 1 - t) * 6)
             }
@@ -340,6 +350,7 @@ Column {
           implicitHeight: Math.max(leftAddress.implicitHeight, rightAddress.implicitHeight)
           Caption {
             id: leftAddress
+            anchors.left: parent.left
             width: parent.width / 2 - Style.space(4)
             text: lane.modelData.computer || ""
             color: lane.linked ? view.foreground : view.dim
@@ -379,7 +390,7 @@ Column {
         text: modelData.sound ? view.catalog.t("chipSound") : modelData.title
         tip: modelData.sound
           ? view.catalog.t("streamSound").arg(view.pathName(modelData.path))
-          : view.catalog.t("streamLine").arg(modelData.title).arg(view.pathName(modelData.path)).arg(modelData.bitRate).arg(modelData.codec.toUpperCase())
+          : view.catalog.t("streamLine").arg(modelData.title, view.pathName(modelData.path), modelData.bitRate, modelData.codec.toUpperCase())
       }
     }
 

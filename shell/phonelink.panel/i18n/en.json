@@ -25,7 +25,6 @@
   "soundPhoneNextTip": "Will play on phone · click for here (S)",
   "networkMap": "Network",
   "back": "Back",
-  "yourRouter": "your router",
   "pathUsb": "USB",
   "pathDirect": "Direct",
   "pathWifi": "Wi-Fi",
@@ -42,10 +41,12 @@
   "whereUsb": "Over the cable, by the phone's serial number. No addresses involved.",
   "whereUsbOff": "Plug the phone in for the fastest connection.",
   "whereDirect": "The phone runs this Wi-Fi Direct link and always takes 192.168.49.1. It gave this computer %1.",
+  "whereDirectOwner": "The phone runs this Wi-Fi Direct link and always takes 192.168.49.1.",
   "whereDirectChannel": "It's on another channel than your Wi-Fi, so phonelink prefers the router.",
   "whereDirectUnsupported": "Needs NetworkManager with wpa_supplicant and a Wi-Fi card that can do Wi-Fi Direct.",
   "whereDirectOff": "Set up when a window opens over Wi-Fi.",
   "whereWifi": "Your router (%1) gave both addresses.",
+  "whereWifiRouter": "Your router gave both addresses.",
   "whereWifiMdns": "The phone announced its debugging port over mDNS.",
   "whereWifiTcpip": "Set up with phonelink wifi over USB.",
   "whereWifiPhone": "Read from the phone itself.",
@@ -64,6 +65,5 @@
   "streamLine": "%1 · %2 · %3bit/s · %4",
   "streamSound": "Phone sound · %1",
   "chipSound": "Sound",
-  "thisComputer": "this computer",
   "removeTip": "Remove from here (X)"
 }
