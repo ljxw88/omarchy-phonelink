@@ -65,7 +65,7 @@ Dimmed: no phone. Accent color: a phone window is open.
   buttons for the network map, the direct link, the Phone menu and
   disconnecting (or Connect and Pair when no phone is connected). Below: tiles
   for Mirror, your recent and pinned apps, and All apps. An open window's tile
-  is filled and marked with a dot; the speaker in a tile's corner shows where
+  is filled; the speaker in a tile's corner shows where
   its sound plays and switches it. The 󰅙 in an app's other corner takes it off
   the panel (a pinned app stays in the launcher); opening it again brings it
   back.

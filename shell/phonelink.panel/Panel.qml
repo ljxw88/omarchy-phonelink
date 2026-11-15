@@ -942,9 +942,9 @@ Panel {
     }
   }
 
-  // A tile: the app's icon and name. An open window's tile is filled and
-  // marked with a dot. The speaker in the corner says where the window's
-  // sound plays, and switches it; an app's other corner takes it off the panel.
+  // A tile: the app's icon and name. An open window's tile is filled. The
+  // speaker in the corner says where the window's sound plays, and switches
+  // it; an app's other corner takes it off the panel.
   component Tile: CursorSurface {
     id: tile
     required property var modelData
@@ -1025,18 +1025,6 @@ Panel {
         font.family: root.bar.fontFamily
         font.pixelSize: Style.font.caption
       }
-    }
-
-    // An open window.
-    Rectangle {
-      visible: tile.isOpen
-      anchors.horizontalCenter: parent.horizontalCenter
-      anchors.bottom: parent.bottom
-      anchors.bottomMargin: Style.space(3)
-      width: Style.space(4)
-      height: width
-      radius: width / 2
-      color: Commons.Color.accent
     }
 
     // Takes the app off the panel, on the tile under the pointer or cursor.
