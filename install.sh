@@ -164,15 +164,12 @@ fi
 if $first_install; then
   cat <<'EOF'
 
-Installed. Set up your phone once:
-  1. Settings › About phone › Software information: tap Build number 7 times.
-  2. Settings › Developer options: turn on Wireless debugging (or USB debugging
-     and plug the phone in).
-  3. Omarchy menu › Phone › Wi-Fi › Pair with QR code, and scan it from
-     Wireless debugging › Pair device with QR code.
+Installed. On the phone, once:
+  1. About phone › Software information › tap Build number 7 times
+  2. Developer options › Wireless debugging: on
+  3. Omarchy menu › Phone › Connection › Pair, and scan the code
 
-Then press Super + Alt + P to open a phone app, or Super + Alt + Shift + P to
-mirror the whole screen.
+Then click the phone icon in the bar.
 EOF
 else
   echo

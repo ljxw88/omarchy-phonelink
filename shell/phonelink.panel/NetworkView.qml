@@ -4,9 +4,10 @@ import qs.Commons
 import qs.Commons as Commons
 
 // The network map: every way this computer has to the phone, drawn as lanes
-// between the two, with the addresses at both ends and where they came from.
-// Video travels from the phone to this computer, so traffic on the lane in
-// use flows right to left.
+// between the two, with the addresses at both ends. Where those addresses
+// came from shows on hover, or under a lane picked with the keyboard. Video
+// travels from the phone to this computer, so traffic on the lane in use
+// flows right to left.
 Column {
   id: view
 
@@ -17,6 +18,8 @@ Column {
   property string fontFamily: Style.font.family
   // The lane the keyboard or mouse is on; -1 shows the one in use.
   property int laneIndex: -1
+  // Picked with the keyboard, which has no tooltip to show the story in.
+  property bool laneByKeyboard: false
   signal laneHovered(int index)
 
   spacing: Style.space(12)
@@ -55,19 +58,26 @@ Column {
       : catalog.t("pathTailscale")
   }
 
+  function pathGlyph(kind) {
+    return kind === "usb" ? "󰕓" : kind === "direct" ? "󱚸" : kind === "wifi" ? "󰖩" : "󰖂"
+  }
+
   function stateText(path) {
-    var text = path.state === "active" ? catalog.t("stateActive")
+    return path.state === "active" ? catalog.t("stateActive")
       : path.state === "connected" ? catalog.t("stateConnected")
       : path.state === "available" ? catalog.t("stateAvailable")
       : path.state === "unsupported" ? catalog.t("stateUnsupported")
       : catalog.t("stateOff")
+  }
+
+  // Live numbers only; the lane's look says the rest.
+  function numbersText(path) {
     var link = path.link
-    if (link) {
-      text += " · " + catalog.t("rtt").arg(Commons.I18n.formatNumber(link.rttMs, 0))
-      if (link.mbps !== null) text += " · " + catalog.t("rate").arg(Commons.I18n.formatNumber(link.mbps, 1))
-      if (link.queueMs > 20) text += " · " + catalog.t("backlog").arg(Commons.I18n.formatNumber(link.queueMs, 0))
-    }
-    return text
+    if (!link) return ""
+    var parts = [catalog.t("rtt").arg(Commons.I18n.formatNumber(link.rttMs, 0))]
+    if (link.mbps !== null) parts.push(catalog.t("rate").arg(Commons.I18n.formatNumber(link.mbps, 1)))
+    if (link.queueMs > 20) parts.push(catalog.t("backlog").arg(Commons.I18n.formatNumber(link.queueMs, 0)))
+    return parts.join("  ")
   }
 
   // Where the addresses on a lane came from, in a sentence or three.
@@ -134,24 +144,34 @@ Column {
     width: view.width
     implicitHeight: Math.max(leftEnd.implicitHeight, rightEnd.implicitHeight)
 
-    Column {
+    Row {
       id: leftEnd
       anchors.left: parent.left
       width: parent.width / 2 - Style.space(8)
-      spacing: Style.space(1)
-      Caption { text: view.catalog.t("thisComputer").toUpperCase(); font.bold: true; font.letterSpacing: 1.2; width: parent.width }
-      Label { text: view.computer.name || ""; font.bold: true; width: parent.width }
-      Caption { text: view.computer.ssid || ""; visible: text !== ""; width: parent.width }
+      spacing: Style.space(6)
+      Label { id: leftGlyph; text: "󰌢"; font.pixelSize: Style.font.heading }
+      Label {
+        anchors.verticalCenter: leftGlyph.verticalCenter
+        width: parent.width - leftGlyph.width - parent.spacing
+        text: view.computer.name || ""
+        font.bold: true
+      }
     }
 
-    Column {
+    Row {
       id: rightEnd
       anchors.right: parent.right
       width: parent.width / 2 - Style.space(8)
-      spacing: Style.space(1)
-      Caption { text: view.catalog.t("phone").toUpperCase(); font.bold: true; font.letterSpacing: 1.2; width: parent.width; horizontalAlignment: Text.AlignRight }
-      Label { text: view.phone ? view.phone.name : view.catalog.t("notReachable"); font.bold: true; width: parent.width; horizontalAlignment: Text.AlignRight }
-      Caption { text: view.phone && view.phone.ssid ? view.phone.ssid : ""; visible: text !== ""; width: parent.width; horizontalAlignment: Text.AlignRight }
+      layoutDirection: Qt.RightToLeft
+      spacing: Style.space(6)
+      Label { id: rightGlyph; text: "󰄜"; font.pixelSize: Style.font.heading; opacity: view.phone ? 1 : 0.45 }
+      Label {
+        anchors.verticalCenter: rightGlyph.verticalCenter
+        width: parent.width - rightGlyph.width - parent.spacing
+        horizontalAlignment: Text.AlignRight
+        text: view.phone ? view.phone.name : "–"
+        font.bold: true
+      }
     }
   }
 
@@ -177,9 +197,16 @@ Column {
       opacity: possible ? 1 : 0.55
 
       MouseArea {
+        id: laneMouse
         anchors.fill: parent
         hoverEnabled: true
         onContainsMouseChanged: if (containsMouse) view.laneHovered(lane.index)
+      }
+
+      PanelToolTip {
+        visible: laneMouse.containsMouse
+        text: view.stateText(lane.modelData) + " · " + view.whereText(lane.modelData)
+        fontFamily: view.fontFamily
       }
 
       Column {
@@ -194,11 +221,18 @@ Column {
         Item {
           width: parent.width
           implicitHeight: Math.max(name.implicitHeight, status.implicitHeight)
-          Label {
+          Row {
             id: name
-            text: view.pathName(lane.modelData.kind)
-            font.bold: lane.live
-            color: lane.live ? view.accent : view.foreground
+            spacing: Style.space(6)
+            Label {
+              text: view.pathGlyph(lane.modelData.kind)
+              color: lane.live ? view.accent : view.foreground
+            }
+            Label {
+              text: view.pathName(lane.modelData.kind)
+              font.bold: lane.live
+              color: lane.live ? view.accent : view.foreground
+            }
           }
           Caption {
             id: status
@@ -207,7 +241,7 @@ Column {
             anchors.leftMargin: Style.space(10)
             anchors.verticalCenter: name.verticalCenter
             horizontalAlignment: Text.AlignRight
-            text: view.stateText(lane.modelData)
+            text: view.numbersText(lane.modelData)
           }
         }
 
@@ -321,7 +355,7 @@ Column {
         }
 
         Caption {
-          visible: lane.expanded
+          visible: view.laneByKeyboard && view.laneIndex === lane.index
           width: parent.width
           wrapMode: Text.WordWrap
           elide: Text.ElideNone
@@ -331,61 +365,62 @@ Column {
     }
   }
 
-  PanelSeparator {
-    foreground: view.foreground
-  }
-
-  // The rest of the picture: the router, the debugging port, the phone's
-  // mobile data, and what's streaming.
-  Column {
+  // What's streaming, and the phone's mobile data, as chips.
+  Flow {
     width: view.width
-    spacing: Style.space(3)
+    spacing: Style.space(6)
+    visible: view.streams.length > 0 || !!(view.phone && view.phone.mobile)
 
-    Caption {
-      width: parent.width
-      wrapMode: Text.WordWrap
-      elide: Text.ElideNone
-      visible: view.network && view.network.router
-      text: !view.network || !view.network.router ? ""
-        : view.catalog.t("routerLine").arg(view.network.router.ip)
-          + (view.network.router.sameAccessPoint === false ? " · " + view.catalog.t("differentAp") : "")
-    }
-    Caption {
-      width: parent.width
-      wrapMode: Text.WordWrap
-      elide: Text.ElideNone
-      visible: text !== ""
-      text: !view.network || !view.network.port || !view.network.port.found ? ""
-        : view.network.port.found === "mdns" ? view.catalog.t("portMdns")
-        : view.network.port.found === "tcpip" ? view.catalog.t("portTcpip")
-        : view.catalog.t("portRemembered")
-    }
-    Caption {
-      width: parent.width
-      wrapMode: Text.WordWrap
-      elide: Text.ElideNone
-      visible: !!(view.phone && view.phone.mobile)
-      text: view.phone && view.phone.mobile ? view.catalog.t("mobileData").arg(view.phone.mobile) : ""
-    }
-
-    Item { width: 1; height: Style.space(6); visible: view.streams.length > 0 }
-
-    PanelSectionHeader {
-      visible: view.streams.length > 0
-      text: view.catalog.t("streams").toUpperCase()
-      foreground: view.foreground
-      fontFamily: view.fontFamily
-    }
     Repeater {
       model: view.streams
-      Label {
+      Chip {
         required property var modelData
-        width: view.width
-        font.pixelSize: Style.font.bodySmall
-        text: modelData.sound
+        glyph: modelData.sound ? "󰽟" : view.pathGlyph(modelData.path)
+        text: modelData.sound ? view.catalog.t("chipSound") : modelData.title
+        tip: modelData.sound
           ? view.catalog.t("streamSound").arg(view.pathName(modelData.path))
           : view.catalog.t("streamLine").arg(modelData.title).arg(view.pathName(modelData.path)).arg(modelData.bitRate).arg(modelData.codec.toUpperCase())
       }
+    }
+
+    Chip {
+      visible: !!(view.phone && view.phone.mobile)
+      glyph: "󰢾"
+      text: view.phone && view.phone.mobile ? view.phone.mobile : ""
+      tip: view.phone && view.phone.mobile ? view.catalog.t("mobileData").arg(view.phone.mobile) : ""
+      opacity: 0.6
+    }
+  }
+
+  component Chip: Rectangle {
+    id: chip
+    property string glyph: ""
+    property string text: ""
+    property string tip: ""
+    implicitWidth: chipRow.implicitWidth + Style.space(12)
+    implicitHeight: chipRow.implicitHeight + Style.space(6)
+    radius: Style.cornerRadius
+    color: "transparent"
+    border.width: 1
+    border.color: Qt.darker(view.foreground, 2.2)
+
+    Row {
+      id: chipRow
+      anchors.centerIn: parent
+      spacing: Style.space(5)
+      Caption { text: chip.glyph; color: view.foreground }
+      Caption { text: chip.text; color: view.foreground; width: Math.min(implicitWidth, Style.space(150)) }
+    }
+
+    MouseArea {
+      id: chipMouse
+      anchors.fill: parent
+      hoverEnabled: true
+    }
+    PanelToolTip {
+      visible: chipMouse.containsMouse && chip.tip !== ""
+      text: chip.tip
+      fontFamily: view.fontFamily
     }
   }
 }

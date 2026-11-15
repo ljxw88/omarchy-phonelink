@@ -9,6 +9,10 @@ import qs.Commons as Commons
 // Bar icon and panel for phonelink. The phonelink command does all the work;
 // this shows its state (`phonelink status --json`) and runs it.
 //
+// The panel is a header (the phone, how it's connected, and icon buttons for
+// the rest) over a grid of tiles: the mirror, recent and pinned apps, and
+// the full app list. Names and explanations live in tooltips.
+//
 // Left click opens the panel, right click mirrors the phone, middle click
 // opens the full app picker.
 Panel {
@@ -49,6 +53,12 @@ Panel {
   property var expectedPrefs: ({})
   property string expectedNow: ""
   property real soundDoneAt: 0
+  // Apps taken off the panel here run `phonelink hide` one at a time. Their
+  // tiles stay gone (`removed`) until a status check that started after the
+  // last of them comes back.
+  property var removeQueue: []
+  property var removed: ({})
+  property real removeDoneAt: 0
   property real statusStartedAt: 0
   property bool refreshQueued: false
   property bool queuedBrief: true
@@ -74,6 +84,13 @@ Panel {
   readonly property bool mirrorOpen: phoneWindows.indexOf("phonelink") >= 0
   function appOpen(pkg) { return phoneWindows.indexOf("phonelink." + pkg) >= 0 }
 
+  readonly property string viaGlyph: reconnecting ? "󰑐"
+    : via === "direct" ? "󱚸"
+    : via === "usb" ? "󰕓"
+    : via === "wifi" ? "󰖩"
+    : via === "tailscale" ? "󰖂"
+    : "󰖪"
+
   readonly property string viaLabel: via === "direct" ? strings.t("viaDirect")
     : via === "usb" ? strings.t("viaUsb")
     : via === "wifi" ? strings.t("viaWifi")
@@ -82,29 +99,56 @@ Panel {
 
   readonly property string statusLabel: !loaded ? strings.t("checking")
     : reconnecting ? strings.t("reconnecting")
-    : connected && effectiveSound === "pc" ? strings.t("statusSoundHere").arg(viaLabel)
     : viaLabel
 
   readonly property string tooltip: connected || reconnecting
     ? strings.t("tooltipConnected").arg(deviceName || strings.t("phone")).arg(statusLabel)
     : strings.t("tooltipDisconnected")
 
-  // One flat list drives both the mouse and the keyboard cursor. Groups:
-  // 0 the mirror, 1 apps, 2 the connection.
-  readonly property var rows: {
-    var list = [{ kind: "mirror", group: 0 }]
-    for (var i = 0; i < apps.length; i++) list.push({ kind: "app", group: 1, app: apps[i] })
-    list.push({ kind: "all", group: 1 })
+  readonly property int columns: 4
+
+  // Header buttons, left to right.
+  readonly property var tools: {
+    var list = [{ kind: "network" }]
     // The direct link needs the phone nearby, so it's no use over Tailscale.
-    list.push({ kind: "network", group: 2 })
-    if (directSupported && via !== "tailscale") list.push({ kind: "direct", group: 2 })
-    if (connected) {
-      list.push({ kind: "disconnect", group: 2 })
-    } else {
-      list.push({ kind: "connect", group: 2 })
-      list.push({ kind: "pair", group: 2 })
-    }
+    if (directSupported && via !== "tailscale") list.push({ kind: "direct" })
+    list.push({ kind: "menu" })
+    if (connected) list.push({ kind: "disconnect" })
     return list
+  }
+
+  // While no phone is connected: connect to a paired one, or pair a new one.
+  readonly property var starts: loaded && !connected && !reconnecting ? [{ kind: "connect" }, { kind: "pair" }] : []
+
+  // The grid: the mirror, recent and pinned apps, and the full list.
+  readonly property var tiles: {
+    var list = [{ kind: "mirror" }]
+    for (var i = 0; i < apps.length; i++) list.push({ kind: "app", app: apps[i] })
+    list.push({ kind: "all" })
+    return list
+  }
+
+  // Everything the keyboard reaches, by row and column: the header buttons,
+  // the start buttons, then the grid.
+  readonly property var items: {
+    var list = []
+    var i
+    for (i = 0; i < tools.length; i++) list.push({ item: tools[i], row: 0, col: i, cols: tools.length })
+    var row = 1
+    if (starts.length > 0) {
+      for (i = 0; i < starts.length; i++) list.push({ item: starts[i], row: 1, col: i, cols: starts.length })
+      row = 2
+    }
+    for (i = 0; i < tiles.length; i++)
+      list.push({ item: tiles[i], row: row + Math.floor(i / columns), col: i % columns, cols: columns })
+    return list
+  }
+  readonly property int firstTile: items.length - tiles.length
+
+  function isSelected(index) { return cursorActive && selectedIndex === index }
+  function select(index) {
+    cursorActive = true
+    selectedIndex = index
   }
 
   property int selectedIndex: 0
@@ -114,6 +158,7 @@ Panel {
   property bool networkOpen: false
   property var network: null
   property int laneIndex: -1
+  property bool laneByKeyboard: false
 
   readonly property color hoverFill: bar ? Style.hoverFillFor(bar.foreground, Commons.Color.accent) : "transparent"
   readonly property color selectedFill: bar ? Style.selectedFillFor(bar.foreground, Commons.Color.accent) : "transparent"
@@ -136,7 +181,8 @@ Panel {
       return
     }
     root.close()
-    if (row.kind === "mirror") run(["mirror"])
+    if (row.kind === "menu") Quickshell.execDetached(["omarchy-menu", "summon", "phone"])
+    else if (row.kind === "mirror") run(["mirror"])
     else if (row.kind === "app") run(["open", row.app.package])
     else if (row.kind === "all") run(["apps"])
     else if (row.kind === "disconnect") run(["stop"])
@@ -198,6 +244,29 @@ Panel {
     soundProcess.running = true
   }
 
+  function removeApp(row) {
+    if (!row || row.kind !== "app") return
+    var pkg = row.app.package
+    var map = {}
+    for (var k in removed) map[k] = true
+    map[pkg] = true
+    removed = map
+    apps = apps.filter(function(app) { return app.package !== pkg })
+    removeQueue = removeQueue.concat([pkg])
+    if (!removeProcess.running) runNextRemove()
+  }
+
+  function runNextRemove() {
+    if (removeQueue.length === 0) {
+      removeDoneAt = Date.now()
+      refresh(!opened)
+      return
+    }
+    removeProcess.command = [root.command, "hide", removeQueue[0]]
+    removeQueue = removeQueue.slice(1)
+    removeProcess.running = true
+  }
+
   function toggleDirect() {
     if (directBusy) return
     shareDirectBusy(true)
@@ -256,6 +325,7 @@ Panel {
     var count = network && network.paths ? network.paths.length : 0
     if (count === 0) return
     laneIndex = laneIndex < 0 ? (dy > 0 ? 0 : count - 1) : Math.max(0, Math.min(count - 1, laneIndex + dy))
+    laneByKeyboard = true
   }
 
   function refreshNetwork() {
@@ -379,12 +449,32 @@ Panel {
     }
   }
 
-  function moveCursor(dy) {
-    if (!cursorActive) {
-      cursorActive = true
+  // Left and right move along a row, up and down to the nearest item in the
+  // next row. The first key press lands on the mirror.
+  function moveCursor(dx, dy) {
+    var current = items[selectedIndex]
+    if (!cursorActive || !current) {
+      select(firstTile)
       return
     }
-    selectedIndex = Math.max(0, Math.min(rows.length - 1, selectedIndex + dy))
+    if (dx !== 0) {
+      var next = selectedIndex + dx
+      if (next >= 0 && next < items.length && items[next].row === current.row) selectedIndex = next
+      return
+    }
+    var row = current.row + dy
+    var x = (current.col + 0.5) / current.cols
+    var best = -1
+    var distance = 2
+    for (var i = 0; i < items.length; i++) {
+      if (items[i].row !== row) continue
+      var d = Math.abs((items[i].col + 0.5) / items[i].cols - x)
+      if (d < distance) {
+        distance = d
+        best = i
+      }
+    }
+    if (best >= 0) selectedIndex = best
   }
 
   onOpenedChanged: {
@@ -397,7 +487,7 @@ Panel {
     refresh(false)
   }
 
-  onRowsChanged: if (selectedIndex >= rows.length) selectedIndex = Math.max(0, rows.length - 1)
+  onItemsChanged: if (selectedIndex >= items.length) selectedIndex = Math.max(0, items.length - 1)
 
   // --- status ----------------------------------------------------------------
 
@@ -469,7 +559,9 @@ Panel {
     if (status.name !== "") deviceName = status.name
     directUp = status.direct
     directSupported = status.directSupported
-    apps = status.apps
+    if (removeQueue.length === 0 && !removeProcess.running && removeDoneAt > 0 && status.startedAt >= removeDoneAt)
+      removed = ({})
+    apps = status.apps.filter(function(app) { return !root.removed[app.package] })
     sound = status.sound
     mirrorSound = status.mirrorSound
     loaded = true
@@ -508,6 +600,13 @@ Panel {
     running: false
     command: []
     onExited: Qt.callLater(root.runNextSound)
+  }
+
+  Process {
+    id: removeProcess
+    running: false
+    command: []
+    onExited: Qt.callLater(root.runNextRemove)
   }
 
   Process {
@@ -556,6 +655,22 @@ Panel {
 
   // --- panel -----------------------------------------------------------------
 
+  function toolGlyph(kind) {
+    return kind === "network" ? "󰛳"
+      : kind === "direct" ? "󱚸"
+      : kind === "menu" ? "󰒓"
+      : kind === "disconnect" ? "󰐥"
+      : "󰁍"
+  }
+
+  function toolTip(kind) {
+    return kind === "network" ? strings.t("networkMap")
+      : kind === "direct" ? (directBusy ? strings.t("directBusy") : directUp ? strings.t("directOn") : strings.t("directOff"))
+      : kind === "menu" ? strings.t("moreOptions")
+      : kind === "disconnect" ? strings.t("disconnect")
+      : strings.t("back")
+  }
+
   KeyboardPanel {
     id: panel
     anchorItem: button
@@ -573,16 +688,17 @@ Panel {
         if (root.networkOpen) {
           if (dx < 0) root.closeNetwork()
           else if (dy !== 0) root.moveLane(dy)
-        } else if (dy !== 0) {
-          root.moveCursor(dy)
+        } else {
+          root.moveCursor(dx, dy)
         }
       }
-      onActivateRequested: if (!root.networkOpen && root.cursorActive) root.activate(root.rows[root.selectedIndex])
+      onActivateRequested: if (!root.networkOpen && root.cursorActive && root.items[root.selectedIndex]) root.activate(root.items[root.selectedIndex].item)
       onCloseRequested: root.networkOpen ? root.closeNetwork() : root.close()
+      onDeleteRequested: if (!root.networkOpen && root.cursorActive && root.items[root.selectedIndex]) root.removeApp(root.items[root.selectedIndex].item)
       onTabRequested: function(direction) { root.switchPanel(direction) }
       onTextKey: function(t) {
         if (t === "m" || t === "M") root.activate({ kind: "mirror" })
-        else if ((t === "s" || t === "S") && root.cursorActive) root.toggleSound(root.rows[root.selectedIndex])
+        else if ((t === "s" || t === "S") && root.cursorActive && root.items[root.selectedIndex]) root.toggleSound(root.items[root.selectedIndex].item)
         else if (t === "n" || t === "N") root.networkOpen ? root.closeNetwork() : root.openNetwork()
       }
 
@@ -591,29 +707,29 @@ Panel {
         anchors.fill: parent
         spacing: Style.space(14)
 
-        // Hero: phone, its name, and how it's connected.
+        // The phone, how it's connected, and buttons for everything else.
         Item {
           width: parent.width
-          implicitHeight: Math.max(heroIcon.implicitHeight, heroLabels.implicitHeight, moreButton.implicitHeight)
+          implicitHeight: Math.max(heroIcon.implicitHeight, heroLabels.implicitHeight, toolRow.implicitHeight)
 
           Text {
             id: heroIcon
             textFormat: Text.PlainText
             anchors.left: parent.left
             anchors.verticalCenter: parent.verticalCenter
-            text: "󰄜"
+            text: root.networkOpen ? "󰛳" : "󰄜"
             color: root.bar.foreground
             font.family: root.bar.fontFamily
             font.pixelSize: Style.font.display
-            opacity: root.connected ? 1.0 : 0.5
+            opacity: root.connected || root.networkOpen ? 1.0 : 0.45
           }
 
           Column {
             id: heroLabels
             anchors.left: heroIcon.right
-            anchors.leftMargin: Style.space(14)
-            anchors.right: moreButton.left
-            anchors.rightMargin: Style.space(12)
+            anchors.leftMargin: Style.space(12)
+            anchors.right: toolRow.left
+            anchors.rightMargin: Style.space(8)
             anchors.verticalCenter: parent.verticalCenter
             spacing: Style.space(2)
 
@@ -628,34 +744,69 @@ Panel {
               width: parent.width
             }
 
-            Text {
-              textFormat: Text.PlainText
-              text: root.statusLabel.toUpperCase()
-              color: Qt.darker(root.bar.foreground, 1.4)
-              font.family: root.bar.fontFamily
-              font.pixelSize: Style.font.caption
-              font.bold: true
-              font.letterSpacing: 1.2
-              elide: Text.ElideRight
-              width: parent.width
+            // How the phone is connected, and a speaker when its sound plays here.
+            Row {
+              visible: !root.networkOpen
+              spacing: Style.space(5)
+
+              Text {
+                id: viaIcon
+                textFormat: Text.PlainText
+                text: root.viaGlyph
+                color: root.connected ? Commons.Color.accent : Qt.darker(root.bar.foreground, 1.4)
+                font.family: root.bar.fontFamily
+                font.pixelSize: Style.font.body
+                RotationAnimation on rotation {
+                  running: root.reconnecting && Style.duration(1000) > 0
+                  from: 0
+                  to: 360
+                  loops: Animation.Infinite
+                  duration: Style.duration(1200)
+                  onRunningChanged: if (!running) viaIcon.rotation = 0
+                }
+              }
+              Text {
+                textFormat: Text.PlainText
+                text: root.statusLabel
+                color: Qt.darker(root.bar.foreground, 1.4)
+                font.family: root.bar.fontFamily
+                font.pixelSize: Style.font.caption
+                anchors.verticalCenter: parent.verticalCenter
+              }
+              Text {
+                visible: root.connected && root.effectiveSound === "pc"
+                textFormat: Text.PlainText
+                text: "󰽟"
+                color: Qt.darker(root.bar.foreground, 1.4)
+                font.family: root.bar.fontFamily
+                font.pixelSize: Style.font.body
+              }
             }
           }
 
-          PanelActionButton {
-            id: moreButton
+          Row {
+            id: toolRow
             anchors.right: parent.right
             anchors.verticalCenter: parent.verticalCenter
-            iconText: root.networkOpen ? "󰁍" : "󰒓"
-            tooltipText: root.networkOpen ? strings.t("back") : strings.t("moreOptions")
-            foreground: root.bar.foreground
-            fontFamily: root.bar.fontFamily
-            onClicked: {
-              if (root.networkOpen) {
-                root.closeNetwork()
-                return
+            spacing: Style.space(2)
+
+            Repeater {
+              model: root.networkOpen ? [{ kind: "back" }] : root.tools
+
+              PanelActionButton {
+                required property var modelData
+                required property int index
+                readonly property bool on: modelData.kind === "direct" && root.directUp
+                iconText: root.toolGlyph(modelData.kind)
+                tooltipText: root.toolTip(modelData.kind)
+                foreground: on ? Commons.Color.accent : root.bar.foreground
+                hoverColor: modelData.kind === "disconnect" ? root.bar.urgent : foreground
+                fontFamily: root.bar.fontFamily
+                hasCursor: !root.networkOpen && root.isSelected(index)
+                opacity: modelData.kind === "direct" && root.directBusy ? 0.5 : 1
+                onHovered: function(isHovered) { if (isHovered && !root.networkOpen) root.select(index) }
+                onClicked: modelData.kind === "back" ? root.closeNetwork() : root.activate(modelData)
               }
-              root.close()
-              Quickshell.execDetached(["omarchy-menu", "summon", "phone"])
             }
           }
         }
@@ -669,213 +820,250 @@ Panel {
           accent: Commons.Color.accent
           fontFamily: root.bar.fontFamily
           laneIndex: root.laneIndex
-          onLaneHovered: function(index) { root.laneIndex = index }
+          laneByKeyboard: root.laneByKeyboard
+          onLaneHovered: function(index) {
+            root.laneIndex = index
+            root.laneByKeyboard = false
+          }
         }
 
-        Column {
-          visible: !root.networkOpen
+        // No phone: connect to a paired one, or pair a new one.
+        Row {
+          visible: !root.networkOpen && root.starts.length > 0
           width: parent.width
-          spacing: Style.space(10)
+          spacing: Style.space(8)
 
           Repeater {
-            model: root.rows
+            model: root.starts
 
-            Column {
-              id: delegateRoot
+            CursorSurface {
+              id: start
               required property var modelData
               required property int index
-              readonly property bool startsGroup: index === 0 || root.rows[index - 1].group !== modelData.group
+              readonly property int itemIndex: root.tools.length + index
+              width: (parent.width - Style.space(8)) / 2
+              implicitHeight: startLabel.implicitHeight + Style.space(18)
+              hasCursor: root.isSelected(itemIndex)
+              foreground: root.bar.foreground
+              fill: root.hoverFill
+              bordered: true
 
-              width: parent.width
-              spacing: Style.space(10)
-
-              PanelSeparator {
-                visible: delegateRoot.startsGroup
-                height: visible ? implicitHeight : 0
-                foreground: root.bar.foreground
+              MouseArea {
+                anchors.fill: parent
+                hoverEnabled: true
+                cursorShape: Qt.PointingHandCursor
+                onContainsMouseChanged: if (containsMouse) root.select(start.itemIndex)
+                onClicked: root.activate(start.modelData)
               }
 
-              PanelSectionHeader {
-                visible: delegateRoot.startsGroup && delegateRoot.modelData.group === 1
-                height: visible ? implicitHeight : 0
-                text: strings.t("apps").toUpperCase()
-                foreground: root.bar.foreground
-                fontFamily: root.bar.fontFamily
-              }
-
-              PhoneRow {
-                width: parent.width
-                rowData: delegateRoot.modelData
-                rowIndex: delegateRoot.index
+              Row {
+                anchors.centerIn: parent
+                spacing: Style.space(8)
+                Text {
+                  textFormat: Text.PlainText
+                  text: start.modelData.kind === "connect" ? "󰌘" : "󰐲"
+                  color: root.bar.foreground
+                  font.family: root.bar.fontFamily
+                  font.pixelSize: Style.font.heading
+                }
+                Text {
+                  id: startLabel
+                  textFormat: Text.PlainText
+                  anchors.verticalCenter: parent.verticalCenter
+                  text: start.modelData.kind === "connect" ? strings.t("connect") : strings.t("pair")
+                  color: root.bar.foreground
+                  font.family: root.bar.fontFamily
+                  font.pixelSize: Style.font.body
+                }
               }
             }
+          }
+        }
+
+        Grid {
+          id: grid
+          visible: !root.networkOpen
+          width: parent.width
+          columns: root.columns
+          spacing: Style.space(6)
+
+          Repeater {
+            model: root.tiles
+            Tile {}
           }
         }
       }
     }
   }
 
-  // One panel row: an app icon or glyph, a title and a caption. The Direct
-  // Wi-Fi row carries a switch; the row itself owns the click.
-  component PhoneRow: CursorSurface {
-    id: row
-    required property var rowData
-    required property int rowIndex
+  // A tile: the app's icon and name. An open window's tile is filled and
+  // marked with a dot. The speaker in the corner says where the window's
+  // sound plays, and switches it; an app's other corner takes it off the panel.
+  component Tile: CursorSurface {
+    id: tile
+    required property var modelData
+    required property int index
 
-    readonly property string kind: rowData.kind
-    readonly property bool isOpen: kind === "mirror" ? root.mirrorOpen
-      : kind === "app" ? root.appOpen(rowData.app.package)
-      : false
-
-    readonly property string glyph: kind === "mirror" ? "󰍹"
-      : kind === "app" ? "󰀲"
-      : kind === "all" ? "󰀻"
-      : kind === "direct" ? "󰖩"
-      : kind === "disconnect" ? "󰅙"
-      : kind === "connect" ? "󰌘"
-      : kind === "network" ? "󰛳"
-      : "󰐲"
-
-    readonly property string iconPath: kind === "app" ? rowData.app.icon : ""
-    readonly property string soundSetting: root.soundOf(rowData)
-    readonly property bool windowOpen: root.rowIsOpen(rowData)
-
-    readonly property string title: kind === "mirror" ? strings.t("mirror")
-      : kind === "app" ? rowData.app.name
+    readonly property string kind: modelData.kind
+    readonly property int itemIndex: root.firstTile + index
+    readonly property bool isOpen: root.rowIsOpen(modelData)
+    readonly property string label: kind === "mirror" ? strings.t("mirror")
       : kind === "all" ? strings.t("allApps")
-      : kind === "direct" ? strings.t("direct")
-      : kind === "disconnect" ? strings.t("disconnect")
-      : kind === "connect" ? strings.t("connect")
-      : kind === "network" ? strings.t("networkMap")
-      : strings.t("pair")
+      : modelData.app.name
+    readonly property string glyph: kind === "mirror" ? "󰦉" : kind === "all" ? "󰀻" : "󰀲"
+    readonly property string iconPath: kind === "app" ? modelData.app.icon : ""
+    readonly property string soundSetting: root.soundOf(modelData)
+    readonly property bool hot: tileMouse.containsMouse || hasCursor
 
-    readonly property string caption: {
-      if (kind === "mirror") return isOpen ? strings.t("open") : strings.t("mirrorCaption")
-      if (kind === "app") return isOpen ? strings.t("open") : (rowData.app.pinned ? strings.t("pinned") : "")
-      if (kind === "all") return strings.t("allAppsCaption")
-      if (kind === "direct") return root.directBusy ? strings.t("directBusy") : (root.directUp ? strings.t("directOn") : strings.t("directOff"))
-      if (kind === "disconnect") return strings.t("disconnectCaption")
-      if (kind === "connect") return strings.t("connectCaption")
-      if (kind === "network") return strings.t("networkMapCaption")
-      return strings.t("pairCaption")
-    }
-
-    hasCursor: root.cursorActive && root.selectedIndex === rowIndex
+    width: (grid.width - grid.spacing * (root.columns - 1)) / root.columns
+    implicitHeight: tileColumn.implicitHeight + Style.space(16)
+    hasCursor: root.isSelected(itemIndex)
     current: isOpen
     foreground: root.bar.foreground
     fill: root.hoverFill
     currentFill: root.selectedFill
-    implicitHeight: rowContent.implicitHeight + Style.spacing.rowPaddingX
 
     MouseArea {
+      id: tileMouse
       anchors.fill: parent
       hoverEnabled: true
       cursorShape: Qt.PointingHandCursor
-      onContainsMouseChanged: if (containsMouse) {
-        root.cursorActive = true
-        root.selectedIndex = row.rowIndex
-      }
-      onClicked: root.activate(row.rowData)
+      onContainsMouseChanged: if (containsMouse) root.select(tile.itemIndex)
+      onClicked: root.activate(tile.modelData)
     }
 
-    Item {
-      id: rowContent
-      anchors.left: parent.left
-      anchors.right: parent.right
-      anchors.verticalCenter: parent.verticalCenter
-      anchors.leftMargin: Style.space(10)
-      anchors.rightMargin: Style.space(10)
-      implicitHeight: Math.max(iconBox.height, labels.implicitHeight, trailing.implicitHeight)
+    PanelToolTip {
+      visible: tileMouse.containsMouse && !badgeMouse.containsMouse && !removeMouse.containsMouse && tileName.truncated
+      text: tile.label
+      fontFamily: root.bar.fontFamily
+    }
+
+    Column {
+      id: tileColumn
+      anchors.centerIn: parent
+      width: parent.width - Style.space(8)
+      spacing: Style.space(6)
 
       Item {
-        id: iconBox
-        anchors.left: parent.left
-        anchors.verticalCenter: parent.verticalCenter
-        width: Math.round(Style.font.heading * 1.5)
-        height: width
+        width: parent.width
+        height: Style.space(32)
 
         Text {
-          visible: row.iconPath === "" || appIcon.status === Image.Error
+          visible: tile.iconPath === "" || appIcon.status === Image.Error
           anchors.centerIn: parent
           textFormat: Text.PlainText
-          text: row.glyph
-          color: root.bar.foreground
+          text: tile.glyph
+          color: tile.isOpen ? Commons.Color.accent : root.bar.foreground
           font.family: root.bar.fontFamily
-          font.pixelSize: Style.font.heading
+          font.pixelSize: Style.font.display
         }
 
         SizedImage {
           id: appIcon
-          visible: row.iconPath !== "" && status !== Image.Error
-          anchors.fill: parent
-          url: row.iconPath !== "" ? Util.fileUrl(row.iconPath) : ""
+          visible: tile.iconPath !== "" && status !== Image.Error
+          anchors.centerIn: parent
+          width: parent.height
+          height: parent.height
+          url: tile.iconPath !== "" ? Util.fileUrl(tile.iconPath) : ""
         }
       }
 
-      Column {
-        id: labels
-        anchors.left: iconBox.right
-        anchors.leftMargin: Style.space(10)
-        anchors.right: trailing.width > 0 ? trailing.left : parent.right
-        anchors.rightMargin: trailing.width > 0 ? Style.space(10) : 0
-        anchors.verticalCenter: parent.verticalCenter
-        spacing: Style.space(1)
+      Text {
+        id: tileName
+        textFormat: Text.PlainText
+        text: tile.label
+        width: parent.width
+        horizontalAlignment: Text.AlignHCenter
+        elide: Text.ElideRight
+        color: root.bar.foreground
+        font.family: root.bar.fontFamily
+        font.pixelSize: Style.font.caption
+      }
+    }
 
-        Text {
-          textFormat: Text.PlainText
-          text: row.title
-          color: root.bar.foreground
-          font.family: root.bar.fontFamily
-          font.pixelSize: Style.font.body
-          elide: Text.ElideRight
-          width: parent.width
-        }
+    // An open window.
+    Rectangle {
+      visible: tile.isOpen
+      anchors.horizontalCenter: parent.horizontalCenter
+      anchors.bottom: parent.bottom
+      anchors.bottomMargin: Style.space(3)
+      width: Style.space(4)
+      height: width
+      radius: width / 2
+      color: Commons.Color.accent
+    }
 
-        Text {
-          textFormat: Text.PlainText
-          visible: row.caption !== ""
-          text: row.caption
-          color: Qt.darker(root.bar.foreground, 1.5)
-          font.family: root.bar.fontFamily
-          font.pixelSize: Style.font.caption
-          elide: Text.ElideRight
-          width: parent.width
-        }
+    // Takes the app off the panel, on the tile under the pointer or cursor.
+    Rectangle {
+      visible: tile.kind === "app" && tile.hot
+      anchors.top: parent.top
+      anchors.left: parent.left
+      anchors.margins: Style.space(3)
+      width: Style.space(18)
+      height: width
+      radius: Style.cornerRadius
+      color: removeMouse.containsMouse ? root.hoverFill : "transparent"
+
+      Text {
+        anchors.centerIn: parent
+        textFormat: Text.PlainText
+        text: "󰅙"
+        color: removeMouse.containsMouse ? root.bar.foreground : Qt.darker(root.bar.foreground, 1.3)
+        font.family: root.bar.fontFamily
+        font.pixelSize: Style.font.bodySmall
       }
 
-      // The Direct Wi-Fi switch, or a mirror or app's sound button.
-      Item {
-        id: trailing
-        anchors.right: parent.right
-        anchors.verticalCenter: parent.verticalCenter
-        width: toggle.visible ? toggle.implicitWidth : soundButton.visible ? soundButton.implicitWidth : 0
-        implicitHeight: toggle.visible ? toggle.implicitHeight : soundButton.visible ? soundButton.implicitHeight : 0
-        height: implicitHeight
+      MouseArea {
+        id: removeMouse
+        anchors.fill: parent
+        hoverEnabled: true
+        cursorShape: Qt.PointingHandCursor
+        onClicked: root.removeApp(tile.modelData)
+      }
 
-        ToggleSwitch {
-          id: toggle
-          visible: row.kind === "direct"
-          interactive: false
-          checked: root.directUp
-          busy: root.directBusy
-          foreground: root.bar.foreground
-          anchors.right: parent.right
-          anchors.verticalCenter: parent.verticalCenter
-        }
+      PanelToolTip {
+        visible: removeMouse.containsMouse
+        text: strings.t("removeTip")
+        fontFamily: root.bar.fontFamily
+      }
+    }
 
-        PanelActionButton {
-          id: soundButton
-          visible: row.soundSetting !== ""
-          anchors.right: parent.right
-          anchors.verticalCenter: parent.verticalCenter
-          iconText: row.soundSetting === "pc" ? "󰽟" : "󰥒"
-          tooltipText: row.windowOpen
-            ? (row.soundSetting === "pc" ? strings.t("soundPcTip") : strings.t("soundPhoneTip"))
-            : (row.soundSetting === "pc" ? strings.t("soundPcNextTip") : strings.t("soundPhoneNextTip"))
-          foreground: root.bar.foreground
-          fontFamily: root.bar.fontFamily
-          onClicked: root.toggleSound(row.rowData)
-        }
+    // Where the sound plays: shown on open windows, and on the tile under the
+    // pointer or cursor, where it can be switched.
+    Rectangle {
+      id: badge
+      visible: tile.soundSetting !== "" && (tile.isOpen || tile.hot)
+      anchors.top: parent.top
+      anchors.right: parent.right
+      anchors.margins: Style.space(3)
+      width: Style.space(18)
+      height: width
+      radius: Style.cornerRadius
+      color: badgeMouse.containsMouse ? root.hoverFill : "transparent"
+
+      Text {
+        anchors.centerIn: parent
+        textFormat: Text.PlainText
+        text: tile.soundSetting === "pc" ? "󰽟" : "󰥒"
+        color: tile.isOpen && tile.soundSetting === "pc" ? Commons.Color.accent : Qt.darker(root.bar.foreground, 1.3)
+        font.family: root.bar.fontFamily
+        font.pixelSize: Style.font.bodySmall
+      }
+
+      MouseArea {
+        id: badgeMouse
+        anchors.fill: parent
+        hoverEnabled: true
+        cursorShape: Qt.PointingHandCursor
+        onClicked: root.toggleSound(tile.modelData)
+      }
+
+      PanelToolTip {
+        visible: badgeMouse.containsMouse
+        text: tile.isOpen
+          ? (tile.soundSetting === "pc" ? strings.t("soundPcTip") : strings.t("soundPhoneTip"))
+          : (tile.soundSetting === "pc" ? strings.t("soundPcNextTip") : strings.t("soundPhoneNextTip"))
+        fontFamily: root.bar.fontFamily
       }
     }
   }
