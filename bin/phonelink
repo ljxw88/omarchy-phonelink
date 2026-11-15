@@ -23,6 +23,7 @@
 #   phonelink doctor       Check for common causes of lag and dropouts
 #   phonelink network      Show every way to the phone, with addresses and where they came from
 #   phonelink network --panel  Open the network map in the bar
+#   phonelink monitor      Live view of each window's quality, frame rate and delay
 #
 # Each phone app runs on its own virtual display that resizes with its window,
 # so it tiles like a desktop app and leaves the phone's own screen alone.
@@ -1683,12 +1684,12 @@ adb_server_pid() {
   ss -Hltnp "sport = :${ANDROID_ADB_SERVER_PORT:-5037}" 2>/dev/null | grep -oE 'pid=[0-9]+' | head -1 | cut -d= -f2
 }
 
-# Prints "idle-ms queue-ms" for the adb server's connection to the phone,
-# from the kernel's view of it: how long since data last arrived, and how
+# Prints "idle-ms queue-ms rtt-ms" for the adb server's connection to the
+# phone, from the kernel's view of it: how long since data last arrived, how
 # far the round trip has grown over its best, which is the backlog on the
-# link. $3 is the adb server's process. adb can hold two connections to one
-# address, one of them idle, so the busiest counts. Prints nothing when it
-# can't tell.
+# link, and the round trip itself ("-" when unknown). $3 is the adb server's
+# process. adb can hold two connections to one address, one of them idle, so
+# the busiest counts. Prints nothing when it can't tell.
 link_stats() {
   ss -tinpH state established "( dst $1 and dport = :$2 )" 2>/dev/null | awk -v want="pid=$3," '
     /^[^ \t]/ { mine = index($0, want) > 0; next }
@@ -1702,9 +1703,13 @@ link_stats() {
         else if (k == "rtt") { split(v, r, "/"); rtt = r[1] + 0 }
         else if (k == "minrtt") min = v + 0
       }
-      if (!found || idle < best) { found = 1; best = idle; queue = (rtt != "" && min != "") ? sprintf("%d", rtt - min) : "" }
+      if (!found || idle < best) {
+        found = 1; best = idle
+        queue = (rtt != "" && min != "") ? sprintf("%d", rtt - min) : "-"
+        round = (rtt != "") ? sprintf("%.1f", rtt) : "-"
+      }
     }
-    END { if (found) print best, queue }'
+    END { if (found) print best, queue, round }'
 }
 
 # Prints "serialno ssid tx-mbps" for the phone, as far as it can tell, in
@@ -1741,37 +1746,58 @@ detect_hevc() {
 # The quality step that last kept up on a path and network, if any. The key
 # goes through the environment: awk -v would read backslashes in a network's
 # name as escapes.
+# A step learned on a network holds for a day: networks get better too.
 quality_get() {
-  K=$1 awk '$1 == ENVIRON["K"] { print $2; exit }' "$QUALITY_FILE" 2>/dev/null
+  K=$1 NOW=$(date +%s) awk '$1 == ENVIRON["K"] { if ($3 == "" || ENVIRON["NOW"] - $3 < 86400) print $2; exit }' \
+    "$QUALITY_FILE" 2>/dev/null
 }
 
 quality_set() {
-  K=$1 V=${2:-} update_file "$QUALITY_FILE" \
-    awk '$1 != ENVIRON["K"] { print } END { if (ENVIRON["V"] != "") print ENVIRON["K"], ENVIRON["V"] }'
+  K=$1 V=${2:-} NOW=$(date +%s) update_file "$QUALITY_FILE" \
+    awk '$1 != ENVIRON["K"] { print } END { if (ENVIRON["V"] != "") print ENVIRON["K"], ENVIRON["V"], ENVIRON["NOW"] }'
 }
 
 # The quality step to start at, from how the phone is connected, how fast
 # its Wi-Fi is, what kept up on this network before, and how many other
 # phone windows share the link.
+# The best step the link has room for. USB and the direct link carry
+# hundreds of Mbit/s, so they get the top step however many windows are
+# open. Through the router, the phone's Wi-Fi speed decides, and windows
+# share the air with each other.
+best_tier() {
+  local path=$1 tx=$2 others=$3 tier
+  case $path in
+  usb | direct) tier=0 ;;
+  tailscale) tier=3 ;;
+  *)
+    tier=1
+    # A tx of 0 means the phone didn't say how fast its Wi-Fi is.
+    if [[ $tx =~ ^[0-9]+$ ]] && ((tx > 0)); then
+      if ((tx >= 100)); then
+        tier=0
+      elif ((tx < 12)); then
+        tier=3
+      elif ((tx < 25)); then
+        tier=2
+      fi
+    fi
+    ;;
+  esac
+  [[ $path == wifi || $path == tailscale ]] && ((others > 0)) && tier=$((tier + 1))
+  ((tier > TIER_LAST)) && tier=$TIER_LAST
+  echo "$tier"
+}
+
+# The step a window starts at: the best one, or lower if this network
+# needed lower lately.
 start_tier() {
   local path=$1 tx=$2 others=$3 key=$4 tier learned
-  case $path in
-  usb) echo 0; return ;;
-  tailscale) tier=3 ;;
-  *) tier=1 ;;
-  esac
-  # A tx of 0 means the phone didn't say how fast its Wi-Fi is.
-  if [[ $path != direct && $tx =~ ^[0-9]+$ ]] && ((tx > 0)); then
-    if ((tx < 12)); then
-      tier=$((tier + 2))
-    elif ((tx < 25)); then
-      tier=$((tier + 1))
-    fi
+  tier=$(best_tier "$path" "$tx" "$others")
+  if [[ $path != usb ]]; then
+    learned=$(quality_get "$key")
+    [[ $learned =~ ^[0-9]+$ ]] && ((learned > tier)) && tier=$learned
+    ((tier > TIER_LAST)) && tier=$TIER_LAST
   fi
-  ((others > 0)) && tier=$((tier + 1))
-  learned=$(quality_get "$key")
-  [[ $learned =~ ^[0-9]+$ ]] && ((learned > tier)) && tier=$learned
-  ((tier > TIER_LAST)) && tier=$TIER_LAST
   echo "$tier"
 }
 
@@ -1790,11 +1816,19 @@ build_args() {
     # The app starts once the display is set up; see start_app_on_display.
     ARGS+=(--new-display="$(tile_size)/$APP_DPI" --flex-display --window-title="$name")
   fi
-  ARGS+=("${wargs[@]}")
+  ARGS+=("${wargs[@]}" --print-fps)
+  # A real keyboard types through the phone's keyboard app. On the phone's
+  # own screen, out of sight, it would take the keys and show nothing here,
+  # so it sits on the window's display, candidates and all.
+  [[ $kind == app && $KEYBOARD == uhid ]] && ARGS+=(--display-ime-policy=local)
 
   if [[ $ADAPT != off ]]; then
     ARGS+=(--video-bit-rate="${TIER_RATES[tier]}" --max-fps="${TIER_FPS[tier]}")
-    ((tier >= 2)) && [[ $hevc == yes ]] && ARGS+=(--video-codec=h265)
+    # H.265 fits more picture into less bandwidth but takes the phone
+    # longer to encode, so only where bandwidth is short.
+    if [[ $hevc == yes ]] && { ((tier >= 3)) || { [[ $path == tailscale ]] && ((tier >= 2)); }; }; then
+      ARGS+=(--video-codec=h265)
+    fi
   fi
   own_args "$kind" "$path"
   ARGS+=("${OWN_ARGS[@]}")
@@ -1975,10 +2009,12 @@ session() {
   local stall cong tick changed=0 lowered=false relaunch="" next="" error hevc_retry=true
   local h264=false hevc_check=false own_rate=false save="" fails=0 quick was_shown resound=false
   local workspace_now limit=50 learned server every=10
+  local best=0 calm=0 calm_wait=120 up_at=-100000 fps skipped rtt codec live
   [[ $kind == app ]] && app_id="phonelink.$pkg"
   APP_ID=$app_id
   log="$LOG_DIR/$app_id.log"
   state="$STATE_DIR/session.$app_id.state"
+  live="$STATE_DIR/live.$app_id"
 
   exec {SESSION_LOCK}>"$STATE_DIR/session.$app_id.lock"
   flock -n "$SESSION_LOCK" || exit 0
@@ -2007,18 +2043,23 @@ session() {
       others=0
       [[ $path != usb ]] && others=$(hyprctl clients -j 2>/dev/null |
         jq --arg c "$app_id" '[.[] | select(.class | startswith("phonelink")) | select(.class != $c)] | length')
+      best=$(best_tier "$path" "${tx:-0}" "${others:-0}")
       tier=$(start_tier "$path" "${tx:-0}" "${others:-0}" "$key")
       if [[ $path == tailscale ]] && tailnet_relayed "${serial%:*}"; then
         ((tier < TIER_LAST)) && tier=$((tier + 1))
+        best=$tier
         session_note "Phone over Tailscale" "Relayed · lighter video for now" normal
       fi
     fi
     build_args "$kind" "$pkg" "$name" "$serial" "$tier" "$hevc"
+    codec=h264
+    [[ " ${ARGS[*]} " == *" --video-codec=h265 "* ]] && codec=h265
     $ever_shown && place_window "$app_id" "$workspace"
     # Emptied before scrcpy starts, so the last run's display isn't taken
-    # for this one's.
+    # for this one's. scrcpy holds back its own lines when writing to a
+    # file; stdbuf has it write each one as it comes, frame rates included.
     : >"$log"
-    SDL_APP_ID="$app_id" scrcpy "${ARGS[@]}" >>"$log" 2>&1 {SESSION_LOCK}>&- &
+    SDL_APP_ID="$app_id" stdbuf -oL -eL scrcpy "${ARGS[@]}" >>"$log" 2>&1 {SESSION_LOCK}>&- &
     SCRCPY_PID=$!
     started=$SECONDS
     log_event "start: $path $serial, quality step $((tier + 1)) (${TIER_RATES[tier]}bit/s), h265=${hevc:-unknown}, link ${tx:-?} Mbit/s, network $ssid"
@@ -2026,7 +2067,7 @@ session() {
     [[ $kind == app ]] && start_app_on_display "$serial" "$pkg" "$log" "$SCRCPY_PID"
 
     read -r host port < <(transport_of "$serial")
-    reason="" shown=false stall=0 cong=0 tick=0
+    reason="" shown=false stall=0 cong=0 tick=0 calm=0 fps="" skipped="" queue="" rtt=""
     last=$(date +%s)
     while kill -0 "$SCRCPY_PID" 2>/dev/null && [[ -z $STOPPING ]]; do
       sleep 2 &
@@ -2080,7 +2121,10 @@ session() {
       if [[ -n $host ]] && $shown && ((SECONDS - started > 8)); then
         # Read each time: adb's server may have restarted.
         server=$(adb_server_pid)
-        read -r idle queue < <(link_stats "$host" "$port" "$server")
+        idle="" queue="" rtt=""
+        read -r idle queue rtt < <(link_stats "$host" "$port" "$server")
+        [[ $queue == - ]] && queue=""
+        [[ $rtt == - ]] && rtt=""
         # The phone sends a frame at least every 100 ms, even of a still
         # screen, so seconds without data means the link is gone. Without a
         # reading, it can't tell; scrcpy ends by itself if adb loses the link.
@@ -2105,6 +2149,31 @@ session() {
           log_event "falling behind: ${queue} ms backlog"
           break
         fi
+
+        # Back up a step once the link has had room to spare for a while.
+        # The restart blinks the window, so it waits for a still screen
+        # (scrcpy draws few frames then) rather than cut into a video.
+        if [[ $ADAPT != off && -n $queue ]] && ! $own_rate && ((tier > best)); then
+          if ((queue <= limit / 2)); then calm=$((calm + 2)); else calm=0; fi
+          if ((calm >= calm_wait && SECONDS - changed >= calm_wait && ${fps:-0} <= 12)); then
+            reason=stepup
+            log_event "room to spare: ${queue} ms backlog for ${calm} s"
+            break
+          fi
+        fi
+      fi
+
+      # What it's running at now, for `phonelink monitor` and the bar.
+      if $shown; then
+        fps="" skipped=""
+        read -r fps skipped < <(tail -n 8 "$log" 2>/dev/null | awk '
+          / fps/ && $2 ~ /^[0-9]+$/ {
+            f = $2; s = 0
+            if (match($0, /\+[0-9]+ frames skipped/)) s = substr($0, RSTART + 1, RLENGTH - 16) + 0
+          }
+          END { if (f != "") print f, s }')
+        printf '%s %s %s %s %s %s %s %s\n' "$(date +%s)" "$path" "$tier" "$codec" \
+          "${fps:--}" "${skipped:--}" "${queue:--}" "${rtt:--}" >"$live.tmp" && mv -f "$live.tmp" "$live"
       fi
 
       # Over Tailscale, look often: once the phone is home, its Tailscale
@@ -2137,9 +2206,21 @@ session() {
     { ! $shown || ((SECONDS - started < 15)); } && quick=true
 
     case $reason in
+    stepup)
+      tier=$((tier - 1))
+      save=$tier
+      changed=$SECONDS up_at=$SECONDS
+      continue
+      ;;
     congested)
       tier=$((tier + 1))
       save=$tier
+      # Back down soon after going up: the link can't hold it, so wait
+      # twice as long before the next try, up to a quarter of an hour.
+      if ((SECONDS - up_at < 300)); then
+        calm_wait=$((calm_wait * 2))
+        ((calm_wait > 900)) && calm_wait=900
+      fi
       changed=$SECONDS
       if ! $lowered; then
         relaunch="Lower quality · keeping up"
@@ -2218,6 +2299,7 @@ session() {
       if ((learned > 0)); then quality_set "$key" $((learned - 1)); else quality_set "$key" ""; fi
     fi
   fi
+  rm -f "$live"
   release_window_rule "$app_id"
   sound_window_closed "$(window_key "$app_id")"
   rm -f "$state"
@@ -2630,6 +2712,67 @@ status() {
   fi
 }
 
+# One screen of `phonelink monitor`: each window's quality step, codec,
+# frame rate, backlog and round trip, as its session last measured them, and
+# the latest quality changes.
+monitor_frame() {
+  local f app epoch path tier codec fps skipped queue rtt name state limit color now width
+  now=$(date +%s)
+  width=$(tput cols 2>/dev/null || echo 100)
+  printf '\e[1m%-22s %-10s %-10s %-6s %8s %9s %8s\e[0m\n' Window Path Quality Codec FPS Backlog RTT
+  for f in "$STATE_DIR"/live.*; do
+    [[ -f $f && $f != *.tmp ]] || continue
+    app=${f##*/live.}
+    session_running "$app" || continue
+    read -r epoch path tier codec fps skipped queue rtt <"$f" || continue
+    [[ $epoch =~ ^[0-9]+$ && $tier =~ ^[0-9]+$ ]] && ((tier <= TIER_LAST)) || continue
+    if [[ $app == phonelink ]]; then name=Mirror; else name=$(app_name "${app#phonelink.}"); fi
+    name=$(tr -d '[:cntrl:]' <<<"$name")
+    state=$(cut -d' ' -f1 "$STATE_DIR/session.$app.state" 2>/dev/null)
+    if [[ $state != up ]] || ((now - epoch > 8)); then
+      printf '\e[2m%-22.22s %-10s %s\e[0m\n' "$name" "$path" "${state:-starting}…"
+      continue
+    fi
+    limit=50
+    [[ $path == tailscale ]] && limit=150
+    color=32
+    [[ $queue =~ ^[0-9]+$ ]] && { ((queue > limit / 2)) && color=33; ((queue > limit)) && color=31; }
+    [[ $skipped =~ ^[0-9]+$ ]] && ((skipped > 0)) && fps="$fps +$skipped"
+    printf '%-22.22s %-10s %-10s %-6s %8s \e[%sm%9s\e[0m %8s\n' "$name" "$path" \
+      "$((tier + 1))/$((TIER_LAST + 1)) ${TIER_RATES[tier]}" "${codec^^}" "$fps" "$color" "$queue ms" "$rtt ms"
+  done
+  if sound_here; then
+    printf '%-22s %s\n' "Phone sound" "$(cut -d' ' -f2 "$SOUND_STATE" 2>/dev/null)"
+  fi
+  echo
+  printf '\e[1mLately\e[0m\n'
+  grep -E 'start: |falling behind|room to spare|frozen|reconnected|better path|giving up|H\.26' "$LOG_DIR/sessions.log" 2>/dev/null |
+    grep -v ' phonelink-sound ' | tail -n 6 | while read -r _ time who what; do
+      printf '%s  %-12.12s %s\n' "${time%:*}" "${who#phonelink.}" "$what" | cut -c1-"$width"
+    done
+}
+
+# A live view of every phone window, redrawn each second until q.
+# --once prints it once, for scripts.
+monitor() {
+  local frame key
+  if [[ ${1:-} == --once || ! -t 1 ]]; then
+    monitor_frame
+    return
+  fi
+  printf '\e[?25l\e[2J'
+  trap 'printf "\e[?25h\n"' EXIT
+  while :; do
+    frame=$(monitor_frame)
+    printf '\e[H%s\e[K\n\n\e[2mq quits\e[0m\e[J' "${frame//$'\n'/$'\e[K\n'}"
+    if [[ -t 0 ]]; then
+      read -rsn1 -t 1 key && [[ $key == [qQ] ]] && break
+    else
+      sleep 1
+    fi
+  done
+}
+
 usage() {
   sed -n '3p' "$SELF" | sed 's/^# //'
   echo
@@ -2821,7 +2964,7 @@ link_json() {
 
 # The open phone windows, from their scrcpy processes, as JSON lines.
 window_facts() {
-  local pid app argv serial title rate codec sound
+  local pid app argv serial title rate codec sound fps step backlog epoch tier
   for pid in $(pgrep -x scrcpy); do
     app=$(tr '\0' '\n' <"/proc/$pid/environ" 2>/dev/null | sed -n 's/^SDL_APP_ID=//p')
     [[ $app == phonelink* ]] || continue
@@ -2837,10 +2980,22 @@ window_facts() {
       esac
     done
     [[ -n $serial ]] || continue
+    # What its session last measured, if it's fresh.
+    fps="" step="" backlog=""
+    if ! $sound && read -r epoch _ tier _ fps _ backlog _ <"$STATE_DIR/live.$app" 2>/dev/null &&
+      [[ $epoch =~ ^[0-9]+$ ]] && (($(date +%s) - epoch <= 8)) && [[ $tier =~ ^[0-9]+$ ]]; then
+      step=$((tier + 1))
+    else
+      fps="" backlog=""
+    fi
+    [[ $fps =~ ^[0-9]+$ ]] || fps=""
+    [[ $backlog =~ ^[0-9]+$ ]] || backlog=""
     jq -nc --arg app "$app" --arg title "$title" --arg serial "$serial" --arg path "$(path_of "$serial")" \
       --arg rate "${rate:-8M}" --arg codec "$codec" --argjson sound "$sound" \
+      --arg fps "$fps" --arg step "$step" --arg backlog "$backlog" \
       '{ app: $app, title: $title, serial: $serial, path: $path, sound: $sound,
-         bitRate: (if $sound then null else $rate end), codec: (if $sound then null else $codec end) }'
+         bitRate: (if $sound then null else $rate end), codec: (if $sound then null else $codec end),
+         fps: ($fps | tonumber? // null), step: ($step | tonumber? // null), backlogMs: ($backlog | tonumber? // null) }'
   done
 }
 
@@ -3154,8 +3309,10 @@ doctor() {
   if [[ -s $QUALITY_FILE ]]; then
     echo
     echo "Quality learned per network"
-    while read -r k t; do
+    while read -r k t at; do
       [[ $t =~ ^[0-9]+$ ]] && ((t <= TIER_LAST)) || continue
+      # Learned steps lapse after a day; see quality_get.
+      [[ -z $at || ! $at =~ ^[0-9]+$ ]] || (($(date +%s) - at < 86400)) || continue
       say "✓" "${k/:/ on }: step $((t + 1)) of $((TIER_LAST + 1)) (${TIER_RATES[t]}bit/s)"
     done <"$QUALITY_FILE"
   fi
@@ -3184,6 +3341,7 @@ main() {
   wifi) require_tools; wifi "${1:-}" ;;
   stop | disconnect) require_tools; disconnect ;;
   doctor) require_tools; doctor ;;
+  monitor) monitor "${1:-}" ;;
   network)
     require_tools
     case ${1:-} in

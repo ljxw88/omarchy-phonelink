@@ -101,7 +101,8 @@ This keeps scrcpy, adb and the user's settings in `~/.config/phonelink`.
   phone the user had disconnected.
 - To see which path the phone uses and where each address came from, run
   `phonelink network`.
-- For lag or dropouts, run `phonelink doctor` first, then read
-  `~/.local/state/phonelink/logs/sessions.log`, which records each window's
-  quality changes and reconnections. More in
+- For lag or dropouts, run `phonelink doctor` first, then
+  `phonelink monitor --once` for each open window's live quality step, frame
+  rate and delay, then read `~/.local/state/phonelink/logs/sessions.log`, which
+  records each window's quality changes and reconnections. More in
   [docs/reference.md](docs/reference.md#troubleshooting).

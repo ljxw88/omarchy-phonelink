@@ -65,5 +65,7 @@
   "streamLine": "%1 · %2 · %3bit/s · %4",
   "streamSound": "Phone sound · %1",
   "chipSound": "Sound",
-  "removeTip": "Remove from here (X)"
+  "removeTip": "Remove from here (X)",
+  "chipFps": "%1 · %2 fps",
+  "streamStep": "quality step %1 of 5"
 }

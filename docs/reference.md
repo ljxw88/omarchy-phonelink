@@ -121,6 +121,13 @@ reachable from here).
 Copy and paste work both ways. Drag a file onto a window to send it to the
 phone, or drag an APK to install it.
 
+**Typing:** your keyboard acts as a real keyboard on the phone, so the phone's
+own keyboard app turns keys into text, with its suggestions, and candidates
+for languages such as Chinese, at the bottom of the window. Switch its
+language with **Shift + Space** (on Samsung's keyboard; others have their own
+shortcut). Keep this computer's input method in English for phone windows, or
+it turns the keys into text before the phone sees them.
+
 Each phone app runs on its own virtual display that resizes with its tile, so
 it lays itself out like a desktop app and leaves the phone's own screen free.
 Apps can't turn that display: an app that only works in landscape or portrait
@@ -183,6 +190,7 @@ phonelink refresh      Re-read the app list from the phone
 phonelink status       Show connected phones and open windows
 phonelink status --json  What the bar shows, as data
 phonelink doctor       Check for common causes of lag and dropouts
+phonelink monitor      Live view of each window's quality, frame rate and delay
 phonelink network      Show every way to the phone, with addresses and where they came from
 phonelink network --panel  Open the network map in the bar
 ```
@@ -290,22 +298,24 @@ change. A restart takes a second or two.
 
 | Step | Bit rate | Frame rate | Used for |
 |---|---|---|---|
-| 1 | 16 Mbit/s | 60 | USB |
-| 2 | 8 Mbit/s | 60 | The direct link or a good Wi-Fi network |
-| 3 | 5 Mbit/s | 60 | A slower Wi-Fi uplink, or several windows at once |
+| 1 | 16 Mbit/s | 60 | USB, the direct link, or Wi-Fi with a fast uplink |
+| 2 | 8 Mbit/s | 60 | Wi-Fi |
+| 3 | 5 Mbit/s | 60 | A slower Wi-Fi uplink |
 | 4 | 3 Mbit/s | 30 | Tailscale |
 | 5 | 1.5 Mbit/s | 24 | Relayed Tailscale, or links that keep falling behind |
 
-From step 3 down, phones with a hardware H.265 encoder use it, which keeps the
-picture sharper at the same bit rate. The mirror also gets smaller at steps 4
-and 5.
+H.265 keeps the picture sharper at low bit rates but takes the phone longer to
+encode, which adds delay. So phones with a hardware H.265 encoder use it only
+when bandwidth is short: from step 4 down, and from step 3 over Tailscale. The
+mirror also gets smaller at steps 4 and 5.
 
-**Choosing the start:** USB always starts at step 1. Otherwise a window starts
-at step 2 nearby or step 4 over Tailscale, and a step lower for each of these:
-the phone's Wi-Fi uplink is under 25 Mbit/s (two steps under 12 Mbit/s, so
-step 4 on your Wi-Fi), another phone window is open (so step 5 over
-Tailscale), and Tailscale relays the traffic. The direct link ignores the
-uplink. If a lower step was needed on this network before, it starts there.
+**Choosing the start:** USB and the direct link carry hundreds of Mbit/s, so
+they start at step 1 however many windows are open. Through your router, a
+window starts at step 2, or step 1 when the phone's Wi-Fi uplink is 100 Mbit/s
+or more, step 3 under 25 Mbit/s and step 4 under 12. Over Tailscale it starts
+at step 4. Through the router and over Tailscale, another open phone window
+shares the air, so the start is a step lower, and so is relayed Tailscale. If
+a lower step was needed on this network in the last day, it starts there.
 Only some phones report their uplink (Samsung's do, as "Calculated Tx"); on
 others, phonelink skips it.
 
@@ -313,8 +323,18 @@ others, phonelink skips it.
 kernel every 2 seconds. When it stays well above its best (50 ms over it
 nearby, 150 ms over Tailscale) for about 10 seconds, the window restarts one
 step lower, at most once every 30 seconds. The step is remembered for that
-network. After 10 minutes without trouble, the next window there starts a step
-higher again.
+network for a day. After 10 minutes without trouble, the next window there
+starts a step higher again.
+
+**Climbing back:** once the backlog has stayed low (under half the limit) for
+2 minutes, a lowered window goes back up a step. The restart blinks the
+window, so it waits for a still screen rather than cut into a video. If the
+step doesn't hold and has to come down again within 5 minutes, the next try
+waits twice as long, up to 15 minutes.
+
+**Watching it:** `phonelink monitor` (or **Phone › Monitor**) shows every
+window live: its step, codec, frame rate, backlog and round trip, and the
+latest changes. The network map's chips show each window's frame rate.
 
 **Dropouts:** the phone sends a frame at least every 100 ms, even of a still
 screen. When no data arrives for 5 seconds twice in a row, or the window closes

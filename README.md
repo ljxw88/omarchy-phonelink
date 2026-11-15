@@ -49,6 +49,7 @@ computer reaches the phone:
 | **Super + Alt + Shift + P** | Mirror the phone |
 | **Super + Alt + V** | Sound here or on the phone |
 | Right / middle click in a phone window | Back / Home |
+| **Shift + Space** in a phone window | Phone keyboard language (Samsung) |
 
 ## Away from home
 

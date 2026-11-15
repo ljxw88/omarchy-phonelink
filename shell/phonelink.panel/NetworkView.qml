@@ -387,10 +387,13 @@ Column {
       Chip {
         required property var modelData
         glyph: modelData.sound ? "󰽟" : view.pathGlyph(modelData.path)
-        text: modelData.sound ? view.catalog.t("chipSound") : modelData.title
+        text: modelData.sound ? view.catalog.t("chipSound")
+          : modelData.fps !== null ? view.catalog.t("chipFps").arg(modelData.title, modelData.fps)
+          : modelData.title
         tip: modelData.sound
           ? view.catalog.t("streamSound").arg(view.pathName(modelData.path))
           : view.catalog.t("streamLine").arg(modelData.title, view.pathName(modelData.path), modelData.bitRate, modelData.codec.toUpperCase())
+            + (modelData.step !== null ? " · " + view.catalog.t("streamStep").arg(modelData.step) : "")
       }
     }
 

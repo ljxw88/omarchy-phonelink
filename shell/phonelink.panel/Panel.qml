@@ -438,7 +438,9 @@ Panel {
         path: kinds.indexOf(w.path) >= 0 ? w.path : "wifi",
         sound: w.sound === true,
         bitRate: clean(w.bitRate, 8),
-        codec: clean(w.codec, 8)
+        codec: clean(w.codec, 8),
+        fps: number(w.fps) !== null ? Math.max(0, Math.min(240, Math.round(w.fps))) : null,
+        step: number(w.step) !== null ? Math.max(1, Math.min(9, Math.round(w.step))) : null
       })
     }
 

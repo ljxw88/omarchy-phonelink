@@ -6,6 +6,7 @@
   "phone.pin": {"icon":"󰐃","label":"Pin apps","action":"phonelink pin"},
   "phone.refresh": {"icon":"󰑐","label":"Refresh apps","action":"phonelink refresh"},
   "phone.network": {"icon":"󰛳","label":"Network","action":"phonelink network --panel"},
+  "phone.monitor": {"icon":"󰐰","label":"Monitor","action":"omarchy-launch-floating-terminal-with-presentation phonelink monitor"},
   "phone.doctor": {"icon":"󰓙","label":"Check connection","action":"omarchy-launch-floating-terminal-with-presentation phonelink doctor"},
   "phone.stop": {"icon":"󰐥","label":"Disconnect","action":"phonelink stop"},
   "phone.wireless": {"icon":"󰖩","label":"Connection"},
