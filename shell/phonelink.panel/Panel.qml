@@ -447,7 +447,7 @@ Panel {
     var router = data.router && typeof data.router === "object" ? data.router : null
     network = {
       computer: { name: clean(c.name, 48), ssid: clean(c.ssid, 48) },
-      phone: ph ? { name: clean(ph.name, 48), ssid: clean(ph.ssid, 48), mobile: clean(ph.mobile, 20) } : null,
+      phone: ph ? { name: clean(ph.name, 48), model: clean(ph.model, 48), ssid: clean(ph.ssid, 48), mobile: clean(ph.mobile, 20) } : null,
       router: router ? { ip: clean(router.ip, 20), sameAccessPoint: router.sameAccessPoint === false ? false : router.sameAccessPoint === true ? true : null } : null,
       port: { found: clean(data.port && data.port.found, 16) },
       paths: paths,
@@ -703,7 +703,7 @@ Panel {
       : kind === "direct" ? "󱚸"
       : kind === "menu" ? "󰒓"
       : kind === "disconnect" ? "󰐥"
-      : "󰁍"
+      : Commons.I18n.rightToLeft ? "󰁔" : "󰁍"
   }
 
   function toolTip(kind) {
@@ -785,11 +785,14 @@ Panel {
               font.bold: true
               elide: Text.ElideRight
               width: parent.width
+              // Set, so it mirrors in right-to-left languages.
+              horizontalAlignment: Text.AlignLeft
             }
 
             // How the phone is connected, and a speaker when its sound plays here.
             Row {
               visible: !root.networkOpen
+              width: parent.width
               spacing: Style.space(5)
 
               Text {
