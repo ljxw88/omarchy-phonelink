@@ -2479,8 +2479,10 @@ network_text() {
 
 # Checks the usual causes of lag and dropouts, and says what to do about each.
 doctor() {
-  local serial="" path="" wifi link freq signal bssid ps con st rssi tx pfreq pbssid serialno hevc decode k t
-  say() { printf '  %s %s\n' "$1" "$2"; }
+  local serial="" path="" wifi link freq signal bssid ps con st rssi tx pfreq pbssid serialno hevc decode log newest="" k t
+  # Names come from the phone and the network, so control characters in them
+  # never reach the terminal.
+  say() { printf '  %s %s\n' "$1" "${2//[[:cntrl:]]/}"; }
 
   echo "Phone"
   adb start-server &>/dev/null
@@ -2513,8 +2515,9 @@ doctor() {
     ps=$(iw dev "$wifi" get power_save 2>/dev/null | awk '{ print $NF }')
     if [[ $ps == on ]]; then
       con=$(nmcli -t -f NAME,DEVICE connection show --active 2>/dev/null | awk -F: -v d="$wifi" '$2 == d { print $1; exit }')
+      con=$(printf '%q' "$con")
       say "!" "Wi-Fi power saving is on, a common cause of lag spikes. To turn it off:"
-      echo "      nmcli connection modify \"$con\" 802-11-wireless.powersave 2 && nmcli connection up \"$con\""
+      echo "      nmcli connection modify $con 802-11-wireless.powersave 2 && nmcli connection up $con"
     else
       say "✓" "Wi-Fi power saving is off"
     fi
@@ -2522,32 +2525,37 @@ doctor() {
     say "✓" "Not on Wi-Fi"
   fi
 
-  if [[ -n $serial && $path != usb ]]; then
+  # Older Android has no `cmd wifi status`, and then nothing is said.
+  [[ -n $serial && $path != usb ]] && st=$(adb -s "$serial" shell cmd wifi status 2>/dev/null | tr -d '\r')
+  if [[ ${st:-} == *"Wifi is connected"* ]]; then
     echo
     echo "The phone's Wi-Fi"
-    st=$(adb -s "$serial" shell cmd wifi status 2>/dev/null | tr -d '\r')
-    if grep -q "Wifi is connected" <<<"$st"; then
-      rssi=$(grep -oE 'RSSI: -?[0-9]+' <<<"$st" | head -1 | grep -oE -- '-?[0-9]+$')
-      tx=$(grep -oE 'Calculated Tx *: *[0-9]+' <<<"$st" | head -1 | grep -oE '[0-9]+$')
-      pfreq=$(grep -oE 'Frequency: [0-9]+' <<<"$st" | head -1 | grep -oE '[0-9]+$')
-      pbssid=$(grep -oE 'BSSID: [0-9a-fA-F:]{17}' <<<"$st" | head -1 | awk '{ print $2 }')
-      if [[ -n $rssi ]]; then
-        if ((rssi < -70)); then say "!" "Weak signal ($rssi dBm), which slows its uplink."; else say "✓" "Signal $rssi dBm"; fi
-      fi
-      if [[ -n $tx ]]; then
-        if ((tx < 25)); then
-          say "!" "Its Wi-Fi uplink carries about $tx Mbit/s, so phonelink keeps the video light."
-        else
-          say "✓" "Uplink about $tx Mbit/s"
-        fi
-      fi
-      [[ -n $pfreq ]] && ((pfreq < 3000)) && say "!" "On 2.4 GHz. Its 5 GHz network would be faster."
-      if [[ $path != tailscale && -n $pbssid && -n ${bssid:-} && ${pbssid,,} != "${bssid,,}" ]]; then
-        say "!" "The phone and this computer use different access points, so video crosses between them. Fine over a wired mesh, slower over a wireless one."
-      fi
-    else
-      say "!" "The phone isn't on Wi-Fi. Android turns Wireless debugging off without it."
+    rssi=$(grep -oE 'RSSI: -?[0-9]+' <<<"$st" | head -1 | grep -oE -- '-?[0-9]+$')
+    tx=$(grep -oE 'Calculated Tx *: *[0-9]+' <<<"$st" | head -1 | grep -oE '[0-9]+$')
+    pfreq=$(grep -oE 'Frequency: [0-9]+' <<<"$st" | head -1 | grep -oE '[0-9]+$')
+    pbssid=$(grep -oE 'BSSID: [0-9a-fA-F:]{17}' <<<"$st" | head -1 | awk '{ print $2 }')
+    if [[ -n $rssi ]]; then
+      if ((rssi < -70)); then say "!" "Weak signal ($rssi dBm), which slows its uplink."; else say "✓" "Signal $rssi dBm"; fi
     fi
+    # Only some phones (Samsung's) estimate their uplink.
+    if [[ -n $tx ]] && ((tx > 0)); then
+      if ((tx < 25)); then
+        say "!" "Its Wi-Fi uplink carries about $tx Mbit/s, so phonelink keeps the video light."
+      else
+        say "✓" "Uplink about $tx Mbit/s"
+      fi
+    fi
+    [[ -n $pfreq ]] && ((pfreq < 3000)) && say "!" "On 2.4 GHz. Its 5 GHz network would be faster."
+    # Only video through the router crosses between access points. A router
+    # has another BSSID on each band, so only BSSIDs on one band tell of two.
+    if [[ $path == wifi && -n $pbssid && -n ${bssid:-} && ${pbssid,,} != "${bssid,,}" && -n $pfreq && -n ${freq:-} ]] &&
+      (((pfreq < 3000 ? 2 : pfreq < 5925 ? 5 : 6) == (freq < 3000 ? 2 : freq < 5925 ? 5 : 6))); then
+      say "!" "The phone and this computer may use different access points, so video crosses between them. Fine over a wired mesh, slower over a wireless one."
+    fi
+  elif [[ ${st:-} == *"Wifi is not connected"* || ${st:-} == *"Wifi is disabled"* ]]; then
+    echo
+    echo "The phone's Wi-Fi"
+    say "!" "The phone isn't on Wi-Fi. Android turns Wireless debugging off without it."
   fi
 
   echo
@@ -2585,7 +2593,11 @@ doctor() {
     *) say "✓" "The phone's encoders get checked when the next window opens" ;;
     esac
   fi
-  decode=$(grep -h "Video decoding:" "$LOG_DIR"/*.log 2>/dev/null | tail -1 | awk '{ print $NF }')
+  # The newest window's log says how this computer decodes now.
+  for log in "$LOG_DIR"/*.log; do
+    grep -qs "Video decoding:" "$log" && [[ -z $newest || $log -nt $newest ]] && newest=$log
+  done
+  decode=$( [[ -n $newest ]] && grep -h "Video decoding:" "$newest" | tail -1 | awk '{ print $NF }')
   case $decode in
   "") ;;
   software) say "!" "This computer decodes the video in software. Installing your GPU's VA-API driver (libva-mesa-driver, intel-media-driver or nvidia-vaapi-driver) takes the load off the CPU." ;;
