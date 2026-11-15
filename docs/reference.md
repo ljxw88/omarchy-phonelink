@@ -8,6 +8,7 @@
 - [The network map](#the-network-map)
 - [Inside a phone window](#inside-a-phone-window)
 - [Sound](#sound)
+- [Which phone](#which-phone)
 - [Commands](#commands)
 - [Settings](#settings)
 - [The direct Wi-Fi link](#the-direct-wi-fi-link)
@@ -43,11 +44,18 @@ It installs any missing packages (`scrcpy`, `android-tools`, `android-udev`,
 - creates `~/.config/phonelink/config` for your settings
 
 Updates replace `~/.config/hypr/phonelink.lua` unless you've edited it. Then
-your copy stays and the new one is saved beside it as `phonelink.lua.new`.
+your copy stays and the new one is saved beside it as `phonelink.lua.new`. If
+the installer has no record of the version it last put there, it replaces the
+file and keeps the old one as `phonelink.lua.bak.<time>`.
 
-If **Super + Alt + P** is already taken, the installer says so. To keep your
-binding, set `phonelink_bindings = false` in `~/.config/hypr/hyprland.lua`,
+If **Super + Alt + P**, **Super + Alt + Shift + P** or **Super + Alt + V** is
+already taken when you first install, the installer says so. To keep your
+bindings, set `phonelink_bindings = false` in `~/.config/hypr/hyprland.lua`,
 above the line that loads phonelink.
+
+`uninstall.sh` undoes all of this except the packages and your settings, and
+deletes the `phonelink-direct` network connection. An edited `phonelink.lua`
+is kept as `phonelink.lua.edited`.
 
 ## The bar icon
 
@@ -62,8 +70,8 @@ Dimmed: no phone. Accent color: a phone window is open.
   the panel (a pinned app stays in the launcher); opening it again brings it
   back.
 
-  Arrow keys or h/j/k/l move, Enter opens, S switches the sound, X removes an
-  app, N opens the network map, Esc closes.
+  Arrow keys or h/j/k/l move, Enter opens, M mirrors, S switches the sound,
+  X removes an app, N opens the network map, Esc closes.
 - **Right click** mirrors the phone.
 - **Middle click** opens the full app list.
 
@@ -139,9 +147,19 @@ opens.
 While the sound plays here, the phone's speaker is silent. It goes to this
 computer's current output, as set in Omarchy's audio panel.
 
+## Which phone
+
+phonelink remembers the phones it has used, by serial number, in
+`~/.local/state/phonelink/phones`, and leaves other Android devices alone. It
+never uses emulators or virtual machines. It learns a phone when you pair it
+with `phonelink pair`, use it over USB, or set it as `SERIAL` in the config,
+and uses the first phone it finds while it knows none. A window that loses its
+connection only reconnects to the same phone.
+
 ## Commands
 
 ```
+phonelink              Open the Phone menu
 phonelink apps         Pick a phone app and open it in its own window
 phonelink open <pkg>   Open one phone app in its own window
 phonelink mirror       Mirror and control the whole phone screen
@@ -150,18 +168,28 @@ phonelink hide <pkg>   Take an app off the bar panel (opening it brings it back)
 phonelink pair         Pair over Wi-Fi with a QR code
 phonelink connect      Connect to a paired phone, nearby or over Tailscale
 phonelink connect <port>  Reach the phone over Tailscale at this Wireless debugging port
+phonelink connect <address:port>  Connect to the phone at this address
 phonelink sound [pc|phone|toggle] [mirror|<pkg>]
                        Play a window's sound on this computer or the phone
 phonelink direct       Link straight to the phone with Wi-Fi Direct
 phonelink direct off   Drop the direct link
-phonelink wifi         Switch a USB-connected phone to Wi-Fi
-phonelink stop         Close phone windows and drop all connections
+phonelink direct toggle  Turn the direct link on or off
+phonelink wifi         Switch a USB-connected phone to Wi-Fi (unencrypted port 5555)
+phonelink wifi off     Close port 5555 again
+phonelink stop         Close phone windows and drop all connections (also: disconnect)
 phonelink refresh      Re-read the app list from the phone
 phonelink status       Show connected phones and open windows
+phonelink status --json  What the bar shows, as data
 phonelink doctor       Check for common causes of lag and dropouts
 phonelink network      Show every way to the phone, with addresses and where they came from
 phonelink network --panel  Open the network map in the bar
 ```
+
+`phonelink stop` also disconnects every other device adb reaches over Wi-Fi,
+such as other phones and TVs, closes port 5555 if `phonelink wifi` opened it,
+and stops adb unless a USB device or an emulator is connected.
+`phonelink status` and `phonelink doctor` start adb again, which reconnects
+the phone.
 
 ## Settings
 
@@ -174,15 +202,22 @@ phonelink network --panel  Open the network map in the bar
 | `APP_DPI` | `200` | Size of the UI in app windows; higher is bigger |
 | `SOUND` | `pc` | Where a window's sound plays until you switch it: `pc` or `phone` |
 | `KEYBOARD` | `uhid` | `uhid` gives the phone a real keyboard, so its own keyboard app handles languages such as Chinese |
-| `SERIAL` | | Use this phone when several are connected |
+| `SERIAL` | | Always use this phone. Windows then stay on the connection they start on |
 | `TAILSCALE` | `auto` | `off` never reaches the phone over Tailscale |
 | `TAILSCALE_HOST` | | The phone's Tailscale name, if phonelink can't work it out |
 | `REMOTE_ARGS` | | Extra scrcpy options over Tailscale |
 | `ADAPT` | `auto` | `off` uses scrcpy's own defaults instead of fitting the quality to the connection |
 | `RECONNECT_SECS` | `120` | How long a window that lost its connection keeps trying; `0` closes it |
-| `MIRROR_ARGS` | `(--max-size=1600)` | Extra scrcpy options for the mirror |
-| `APP_ARGS` | | Extra scrcpy options for app windows |
-| `COMMON_ARGS` | | Extra scrcpy options for both. They override the automatic quality |
+| `MIRROR_ARGS` | `(--max-size=1600)` | scrcpy options for the mirror |
+| `APP_ARGS` | `(--no-vd-system-decorations --keep-active)` | scrcpy options for app windows |
+| `COMMON_ARGS` | | Extra scrcpy options for both |
+
+Setting `MIRROR_ARGS` or `APP_ARGS` replaces its default, so keep the default
+options you still want. Your options come after the automatic quality ones, so
+they win. With a `--video-bit-rate` of your own, phonelink no longer lowers the
+quality when the link falls behind; it still reconnects after drops. The
+mirror's `--max-size` is the largest it gets: quality steps 4 and 5 make it
+smaller still.
 
 To float the mirror instead of tiling it, uncomment the last line of
 `~/.config/hypr/phonelink.lua`.
@@ -194,9 +229,15 @@ only on Wi-Fi, phonelink links the two directly with Wi-Fi Direct, the
 connection Samsung's Smart View uses. Both stay on your home network.
 
 The first window you open in a session sets it up, which takes about 15
-seconds. The phone needs to be unlocked. It briefly shows its Wi-Fi Direct page,
-and phonelink taps Connect on the invitation for you. If that tap doesn't
-happen, tap Connect yourself.
+seconds. phonelink wakes the phone and waits up to 30 seconds for you to
+unlock it. To open the phone's Wi-Fi Direct page fresh, it closes the phone's
+Settings app, so anything you had open there is lost. phonelink taps Connect
+on the invitation for you. If that tap doesn't happen, tap Connect yourself.
+
+If setting up the link fails, phonelink uses your router. While the link is
+down, each window you open tries again, but not within 10 minutes of a failed
+try. The link is saved as a NetworkManager connection named
+`phonelink-direct`, which stays until you uninstall phonelink.
 
 ## Away from home (Tailscale)
 
@@ -211,8 +252,9 @@ connections always come first, so at home nothing changes.
 
 **How phonelink finds the phone:** whenever the phone connects nearby,
 phonelink notes its Tailscale address and Wireless debugging port. If it has
-never seen the phone, it uses the tailnet's only Android device, or
-`TAILSCALE_HOST` from the config.
+never seen the phone, it uses your only Android device on the tailnet, or
+`TAILSCALE_HOST` from the config. Other people's devices on the tailnet, and
+devices shared with you, are never used.
 
 **When the port changes:** Wireless debugging picks a new port each time it's
 turned on, including after the phone changes Wi-Fi network. Then phonelink asks
@@ -223,6 +265,9 @@ also give it directly with `phonelink connect <port>`.
 The phone then listens on port 5555 until it restarts, on any network,
 including mobile data. phonelink tries that port over Tailscale. A computer the
 phone hasn't allowed before has to be approved on the phone's screen.
+Unlike Wireless debugging, this port isn't encrypted, so avoid it on shared
+networks. `phonelink wifi off` or `phonelink stop` closes it. If the phone is
+already connected over Wi-Fi, `phonelink wifi` doesn't restart anything.
 
 **Speed:** video starts lighter over Tailscale, and the direct Wi-Fi link is
 off, since the phone isn't nearby. How smooth it is depends on the
@@ -253,15 +298,21 @@ From step 3 down, phones with a hardware H.265 encoder use it, which keeps the
 picture sharper at the same bit rate. The mirror also gets smaller at steps 4
 and 5.
 
-**Choosing the start:** a window starts from how the phone is connected, the
-uplink speed Android reports for its Wi-Fi, how many other phone windows share
-the link, and what kept up on this network before.
+**Choosing the start:** USB always starts at step 1. Otherwise a window starts
+at step 2 nearby or step 4 over Tailscale, and a step lower for each of these:
+the phone's Wi-Fi uplink is under 25 Mbit/s (two steps under 12 Mbit/s, so
+step 4 on your Wi-Fi), another phone window is open (so step 5 over
+Tailscale), and Tailscale relays the traffic. The direct link ignores the
+uplink. If a lower step was needed on this network before, it starts there.
+Only some phones report their uplink (Samsung's do, as "Calculated Tx"); on
+others, phonelink skips it.
 
 **Falling behind:** phonelink reads the connection's round-trip time from the
 kernel every 2 seconds. When it stays well above its best (50 ms over it
 nearby, 150 ms over Tailscale) for about 10 seconds, the window restarts one
-step lower. The step is remembered for that network. After 10 minutes without
-trouble, the next window there starts a step higher again.
+step lower, at most once every 30 seconds. The step is remembered for that
+network. After 10 minutes without trouble, the next window there starts a step
+higher again.
 
 **Dropouts:** the phone sends a frame at least every 100 ms, even of a still
 screen. When no data arrives for 5 seconds twice in a row, or the window closes
@@ -272,17 +323,19 @@ it was on, without switching your view. App windows reopen the app, which most
 apps resume where they were. The same happens after this computer wakes from
 sleep.
 
-**Better paths:** every 20 seconds, phonelink checks for a faster way to the
-phone. Plugging the phone in moves the windows to USB, and coming home moves
-them from Tailscale to your Wi-Fi.
+**Better paths:** every 20 seconds nearby, and every 6 over Tailscale,
+phonelink checks for a faster way to the phone. Plugging the phone in moves the
+windows to USB, and coming home moves them from Tailscale to your Wi-Fi. With
+`SERIAL` set, windows stay on the connection they start on.
 
 **The direct link:** when it ends up on a different Wi-Fi channel than your
 network, the Wi-Fi card has to switch between the two, which slows both. Then
 phonelink uses the router instead.
 
 **Sound:** the phone's sound has its own connection, which reconnects and
-moves to a better path the same way the windows do. Over Wi-Fi and Tailscale it
-buffers a little more audio, so short hiccups don't crackle.
+moves to a better path the same way the windows do, checking every 10 seconds.
+Over Wi-Fi and Tailscale it buffers a little more audio, so short hiccups
+don't crackle.
 
 **What phonelink can't fix:** Android's low-latency Wi-Fi mode needs a rooted
 phone. A connection that's simply too slow stays slow; `phonelink doctor`
@@ -296,7 +349,8 @@ What each window decided, and why, is logged in
 
 - **Laggy, or keeps reconnecting.** Run `phonelink doctor`, or
   **Omarchy menu › Phone › Check connection**. It checks both Wi-Fi
-  connections, the direct link and Tailscale, and says what to change.
+  connections, the phone's uplink on phones that report it, the direct link
+  and Tailscale, and says what to change.
 
 - **No phone found.** Check that Wireless debugging is on. Android turns it off
   when the phone restarts or changes Wi-Fi network. A quick-settings tile helps:
@@ -315,8 +369,8 @@ What each window decided, and why, is logged in
 - **No sound on this computer.** Check the window's sound button in the bar
   panel. Sound needs Android 11 or newer. If it still fails, the error is in
   `~/.local/state/phonelink/logs/phonelink-sound.log`.
-- **Android emulators.** phonelink ignores them. To use one anyway, set
-  `SERIAL` to its name, such as `emulator-5554`.
+- **Another phone, an emulator or a virtual machine.** phonelink only uses the
+  phones it knows. See [Which phone](#which-phone).
 - **Disconnect and Android Studio.** Disconnecting normally stops adb, because
   that's the only way to stop it reconnecting the phone while Wireless
   debugging is on. If an emulator or a USB device is connected, adb stays up for
@@ -327,7 +381,16 @@ Each window's scrcpy log is in `~/.local/state/phonelink/logs/`, beside
 
 ## Privacy
 
-Everything between your computer and phone stays on your network. The one
-exception is app icons: the first time you open or pin a phone app, phonelink
-fetches its icon from the app's Google Play page, which tells Google the app's
-package name. Set `APP_ICONS="off"` to use a generic icon instead.
+phonelink has no servers of its own; video, sound and input go between your
+computer and phone. Worth knowing:
+
+- Over Tailscale, traffic may pass through Tailscale's relay servers when the
+  two can't connect directly. It stays encrypted.
+- `phonelink wifi` opens port 5555 on the phone, which isn't encrypted, so
+  others on the same network can read the traffic. Wireless debugging is
+  encrypted.
+- App icons: the first time you open or pin a phone app, phonelink looks it up
+  on Google Play and downloads its icon from Google's image server, which tells
+  Google the app's package name. Pinning an app whose icon wasn't found looks
+  it up again. Set `APP_ICONS="off"` to use a generic icon and make no such
+  requests.

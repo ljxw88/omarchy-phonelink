@@ -1,6 +1,7 @@
 # phonelink settings (bash). Uncomment to change a default.
 
-# Use one specific phone when several are connected (see `phonelink status`).
+# Always use this phone (see `phonelink status`). Windows then stay on the
+# connection they start on, rather than moving to a faster one.
 # SERIAL="R5CT1234567"
 
 # Over Wi-Fi, link straight to the phone with Wi-Fi Direct (auto), or always go
@@ -20,7 +21,8 @@
 # SOUND="pc"
 
 # App icons for the dock, launcher and bar come from each app's Google Play
-# page, which tells Google the app's package name. "off" uses a generic icon.
+# page and Google's image server, which tells Google the app's package name.
+# "off" uses a generic icon.
 # APP_ICONS="play"
 
 # Video quality follows the connection by itself (auto). "off" uses scrcpy's
@@ -30,10 +32,13 @@
 # seconds. 0 closes it instead.
 # RECONNECT_SECS=120
 
-# Extra scrcpy options (see `scrcpy --help`). They override the automatic
-# quality, so a fixed bit rate here turns the adapting off for it:
+# Extra scrcpy options (see `scrcpy --help`). They come after the automatic
+# quality, so they win, and a bit rate of your own stops phonelink lowering
+# the quality when the link falls behind:
 # COMMON_ARGS=(--video-bit-rate=8M)
-# Show the phone keyboard and IME candidates inside app windows instead of on the phone:
+# Options for app windows. Setting this replaces the default, the first two
+# options here. To show the phone keyboard and IME candidates inside app
+# windows instead of on the phone:
 # APP_ARGS=(--no-vd-system-decorations --keep-active --display-ime-policy=local)
 # Mirror resolution cap, in pixels on the long side. Lower is snappier over Wi-Fi.
 # Add --turn-screen-off to keep the phone's own screen dark while mirroring:
