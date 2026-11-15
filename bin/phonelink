@@ -1416,7 +1416,8 @@ build_args() {
   if [[ $kind == mirror ]]; then
     ARGS+=(--window-title="$name")
   else
-    ARGS+=(--new-display="$(tile_size)/$APP_DPI" --flex-display --start-app="$pkg" --window-title="$name")
+    # The app starts once the display is set up; see start_app_on_display.
+    ARGS+=(--new-display="$(tile_size)/$APP_DPI" --flex-display --window-title="$name")
   fi
   ARGS+=("${wargs[@]}")
 
@@ -1499,6 +1500,43 @@ end_scrcpy() {
   return 0
 }
 
+# Starts the app on a window's display, once the app can no longer turn
+# that display.
+#
+# scrcpy gives each app window its own display, made to rotate with its
+# content. On a display under 600 dp across, which a tile becomes once the
+# workspace is split, Android lets an app pick the orientation. A landscape
+# video in a portrait tile then rotates the display, scrcpy resizes it back
+# to the tile, the app rotates it again, and so on for as long as it's open.
+# Told to ignore orientation requests, as large screens do, Android fits the
+# app into the tile instead. The app starts only after that, so it never
+# sees a display it can turn.
+start_app_on_display() {
+  local serial=$1 pkg=$2 log=$3 pid=$4 id="" component _
+  for _ in {1..100}; do
+    id=$(grep -oE 'New display: .*\(id=[0-9]+\)' "$log" 2>/dev/null | tail -1 | grep -oE '[0-9]+\)$' | tr -d ')')
+    [[ -n $id ]] && break
+    kill -0 "$pid" 2>/dev/null || return 1
+    sleep 0.1
+  done
+  [[ -n $id ]] || return 1
+
+  adb -s "$serial" shell wm set-ignore-orientation-request -d "$id" true &>/dev/null ||
+    log_event "couldn't stop apps turning display $id"
+
+  component=$(adb -s "$serial" shell cmd package resolve-activity --brief \
+    -a android.intent.action.MAIN -c android.intent.category.LAUNCHER "$pkg" 2>/dev/null | tr -d '\r' | tail -1)
+  [[ $component == */* ]] ||
+    component=$(adb -s "$serial" shell cmd package resolve-activity --brief "$pkg" 2>/dev/null | tr -d '\r' | tail -1)
+  if [[ $component == */* ]]; then
+    adb -s "$serial" shell am start --display "$id" -a android.intent.action.MAIN \
+      -c android.intent.category.LAUNCHER -n "$component" &>/dev/null
+  else
+    log_event "no launcher activity for $pkg"
+    return 1
+  fi
+}
+
 session() {
   local kind=$1 pkg=$2 name=$3 serial=$4
   local app_id=phonelink log state path serialno ssid tx key hevc tier="" others code reason
@@ -1545,6 +1583,7 @@ session() {
     SCRCPY_PID=$!
     log_event "start: $path $serial, quality step $((tier + 1)) (${TIER_RATES[tier]}bit/s), h265=${hevc:-unknown}, link ${tx:-?} Mbit/s, network $ssid"
     echo "up $path $tier" >"$state"
+    [[ $kind == app ]] && start_app_on_display "$serial" "$pkg" "$log" "$SCRCPY_PID"
 
     read -r host port < <(transport_of "$serial")
     server=$(adb_server_pid)

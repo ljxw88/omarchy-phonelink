@@ -113,6 +113,9 @@ phone, or drag an APK to install it.
 
 Each phone app runs on its own virtual display that resizes with its tile, so
 it lays itself out like a desktop app and leaves the phone's own screen free.
+Apps can't turn that display: an app that only works in landscape or portrait
+is fitted into the window's shape, with bars if it has to, the way Android
+tablets do it.
 The mirror keeps the phone's shape inside its tile.
 
 ## Sound
@@ -302,6 +305,10 @@ What each window decided, and why, is logged in
   run `phonelink connect <port>` with the port the phone shows.
 - **A black window.** Some apps, such as banking apps and Netflix, block screen
   capture.
+- **A landscape video looks small next to another window.** Side by side, each
+  window is taller than it is wide, so the video is fitted in with bars. Press
+  **Super + J** to stack the windows instead, which makes both wide, or give the
+  video the whole workspace.
 - **No sound on this computer.** Check the window's sound button in the bar
   panel. Sound needs Android 11 or newer. If it still fails, the error is in
   `~/.local/state/phonelink/logs/phonelink-sound.log`.
