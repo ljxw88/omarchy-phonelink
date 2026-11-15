@@ -181,6 +181,22 @@ tile_size() {
   printf '%dx%d' $((w / 2 * 2)) $((h / 2 * 2))
 }
 
+# Replaces state file $1 with what the command after it prints, given the
+# old one on stdin. The new file is written beside the old and renamed over
+# it, so the bar never reads half of one, and one change happens at a time,
+# so two at once both count.
+update_file() {
+  local file=$1 tmp lock src=/dev/null
+  shift
+  exec {lock}>"$STATE_DIR/update.lock"
+  flock -w 10 "$lock"
+  [[ -f $file ]] && src=$file
+  if tmp=$(mktemp "${file%/*}/.${file##*/}.XXXXXX"); then
+    if "$@" <"$src" >"$tmp"; then mv -f "$tmp" "$file"; else rm -f "$tmp"; fi
+  fi
+  exec {lock}>&-
+}
+
 # ---------------------------------------------------------------- devices
 
 # Closes phonelink's lock files in this subshell, before it runs something
@@ -1015,7 +1031,7 @@ device_label() {
 # a name of 30 characters or more is followed by the package on its own line.
 refresh_apps() {
   local serial=$1 tmp
-  tmp=$(mktemp)
+  tmp=$(mktemp "$STATE_DIR/.apps.tsv.XXXXXX")
   scrcpy -s "$serial" --list-apps 2>&1 | awk '
     /^ [*-] / {
       line = substr($0, 4)
@@ -1045,20 +1061,14 @@ refresh_apps() {
 }
 
 record_recent() {
-  local tmp
-  tmp=$(mktemp)
-  { echo "$1"; grep -vxF "$1" "$RECENT_FILE" 2>/dev/null; } | head -6 >"$tmp"
-  mv "$tmp" "$RECENT_FILE"
+  update_file "$RECENT_FILE" awk -v p="$1" 'BEGIN { print p } $0 != p && ++n < 6'
   unhide_app "$1"
 }
 
 # Removes $1 from the list in file $2.
 drop_line() {
-  local tmp
   [[ -f $2 ]] || return 0
-  tmp=$(mktemp)
-  grep -vxF "$1" "$2" >"$tmp"
-  mv "$tmp" "$2"
+  update_file "$2" awk -v l="$1" '$0 != l'
 }
 
 # The bar panel lists recent and pinned apps. Hiding one forgets it as recent,
@@ -1069,8 +1079,8 @@ hide_app() {
   valid_pkg "$pkg" || die "Not an Android package name: $pkg"
   mkdir -p "$STATE_DIR"
   drop_line "$pkg" "$RECENT_FILE"
-  if is_pinned "$pkg" && ! grep -qxF "$pkg" "$HIDDEN_FILE" 2>/dev/null; then
-    echo "$pkg" >>"$HIDDEN_FILE"
+  if is_pinned "$pkg"; then
+    update_file "$HIDDEN_FILE" awk -v p="$pkg" '{ print } $0 == p { found = 1 } END { if (!found) print p }'
   fi
 }
 
@@ -1155,6 +1165,7 @@ is_pinned() {
 # goes back to the phone.
 SOUND_ID="phonelink-sound"
 SOUND_PREFS="$STATE_DIR/sound"
+SOUND_STATE="$STATE_DIR/sound.state"
 
 # The setting key for a phonelink window id or class, if it is one.
 window_key() {
@@ -1190,10 +1201,7 @@ sound_pref() {
 }
 
 set_sound_pref() {
-  local tmp
-  tmp=$(mktemp)
-  { awk -v k="$1" '$1 != k' "$SOUND_PREFS" 2>/dev/null; echo "$1 $2"; } >"$tmp"
-  mv "$tmp" "$SOUND_PREFS"
+  update_file "$SOUND_PREFS" awk -v k="$1" -v v="$2" '$1 != k { print } END { print k, v }'
 }
 
 # One change to the phone's sound at a time. The sound connection starts in
@@ -1257,17 +1265,21 @@ foreign_sound_pids() {
 # Windows on screen, plus window sessions still running, which includes ones
 # opening or reconnecting their window. Only used to decide when the sound
 # can go back to the phone. $1 leaves out a window that's closing: its
-# session is still running while it asks.
+# session is still running while it asks. Sessions marked closing are left
+# out too, or two windows closing together would keep the sound for each
+# other.
 live_window_keys() {
-  local leave=${1:-} pid argv
+  local leave=${1:-} pid argv key id
   {
     open_window_keys
     for pid in $(session_pids); do
       mapfile -d '' -t argv 2>/dev/null <"/proc/$pid/cmdline" || continue
       case ${argv[3]:-} in
-      mirror) echo mirror ;;
-      app) [[ -n ${argv[4]:-} ]] && echo "${argv[4]}" ;;
+      mirror) key=mirror id=phonelink ;;
+      app) key=${argv[4]:-} id="phonelink.${argv[4]:-}" ;;
+      *) continue ;;
       esac
+      [[ -n $key && $(session_state "$id") != closing ]] && echo "$key"
     done
   } | sort -u | grep -vxF -- "${leave:-//none//}" || true
 }
@@ -1302,6 +1314,7 @@ sound_stop() {
   for pid in $(sound_session_pids) $(sound_pids) $helpers; do
     kill -KILL "$pid" 2>/dev/null
   done
+  rm -f "$SOUND_STATE"
   sleep 0.2
 }
 
@@ -1328,8 +1341,7 @@ sound_start() {
     runner=(setsid -f "$SELF" __sound "$serial")
   fi
   (
-    [[ -n $LAUNCH_LOCK ]] && exec {LAUNCH_LOCK}>&-
-    [[ -n $SOUND_LOCK ]] && exec {SOUND_LOCK}>&-
+    close_locks
     exec "${runner[@]}" &>/dev/null
   )
 
@@ -1347,10 +1359,10 @@ sound_start() {
 # connection when one turns up. It ends when stopped, or when no phone window
 # is left to want the sound.
 sound_session() {
-  local serial=$1 log path args code reason next started tick now last error up=false tries=0
+  local serial=$1 log path args code reason next started tick now last error up=false tries=0 short=0
   APP_ID=$SOUND_ID
   log="$LOG_DIR/$SOUND_ID.log"
-  local state="$STATE_DIR/session.$SOUND_ID.state"
+  local state=$SOUND_STATE
 
   trap 'STOPPING=1; end_scrcpy' TERM INT HUP
   WANT_PHONE=$(phone_id "$serial")
@@ -1397,21 +1409,37 @@ sound_session() {
     log_event "sound ended: code $code${reason:+, $reason}${STOPPING:+, stopping}"
     [[ -n $STOPPING ]] && break
 
-    if [[ $reason == upgrade ]]; then
+    case $reason in
+    upgrade)
       serial=$next
       continue
-    fi
-    ((code == 0)) && break
-    if ((code == 1)) && ! $up; then
-      # The phone may still be letting go of the last capture; try again.
-      if ((tries < 2)); then
-        tries=$((tries + 1))
-        sleep 1 &
-        wait $!
-        continue
+      ;;
+    # scrcpy takes the end of a stall for a quit, with code 0. Find the
+    # phone again instead.
+    stall) ;;
+    *)
+      ((code == 0)) && break
+      if ((code == 1)) && ! $up; then
+        # The phone may still be letting go of the last capture; try again.
+        if ((tries < 2)); then
+          tries=$((tries + 1))
+          sleep 1 &
+          wait $!
+          continue
+        fi
+        error=$(grep -E "ERROR:" "$log" | tail -1 | sed 's/.*ERROR: *//')
+        notify -u normal "Phone sound stays on the phone" "${error:-It could not be played here. See $log}"
+        break
       fi
+      ;;
+    esac
+
+    # Runs that keep ending at once would otherwise reconnect forever.
+    if ((SECONDS - started < 15)); then short=$((short + 1)); else short=0; fi
+    if ((short >= 3)); then
+      log_event "sound: giving up, 3 short runs in a row"
       error=$(grep -E "ERROR:" "$log" | tail -1 | sed 's/.*ERROR: *//')
-      notify -u normal "Phone sound stays on the phone" "${error:-It could not be played here. See $log}"
+      notify -u normal "Phone sound stays on the phone" "${error:-It kept stopping. See $log}"
       break
     fi
 
@@ -1546,8 +1574,7 @@ spawn_session() {
   fi
   # What it starts mustn't hold phonelink's locks for as long as it runs.
   (
-    [[ -n $LAUNCH_LOCK ]] && exec {LAUNCH_LOCK}>&-
-    [[ -n $SOUND_LOCK ]] && exec {SOUND_LOCK}>&-
+    close_locks
     exec "${runner[@]}" &>/dev/null
   )
 }
@@ -1586,6 +1613,24 @@ session_running() {
   flock -n "$fd" && free=true
   exec {fd}>&-
   ! $free
+}
+
+# What a window session is doing: up, reconnecting or closing.
+session_state() {
+  local word=""
+  read -r word _ 2>/dev/null <"$STATE_DIR/session.$1.state"
+  printf '%s' "$word"
+}
+
+# A closing session keeps its lock while it hands the sound back, which can
+# take seconds. Waits for it to end, so the window can open again.
+session_wait_closed() {
+  local fd ended=false
+  [[ $(session_state "$1") == closing ]] || return 1
+  exec {fd}>"$STATE_DIR/session.$1.lock"
+  flock -w 10 "$fd" && ended=true
+  exec {fd}>&-
+  $ended
 }
 
 wait_for_window() {
@@ -1641,30 +1686,42 @@ adb_server_pid() {
 # Prints "idle-ms queue-ms" for the adb server's connection to the phone,
 # from the kernel's view of it: how long since data last arrived, and how
 # far the round trip has grown over its best, which is the backlog on the
-# link. $3 is the adb server's process.
+# link. $3 is the adb server's process. adb can hold two connections to one
+# address, one of them idle, so the busiest counts. Prints nothing when it
+# can't tell.
 link_stats() {
   ss -tinpH state established "( dst $1 and dport = :$2 )" 2>/dev/null | awk -v want="pid=$3," '
-    /users:\(\(/ { mine = index($0, want) > 0; next }
-    mine { for (i = 1; i <= NF; i++) {
+    /^[^ \t]/ { mine = index($0, want) > 0; next }
+    mine {
+      mine = 0; idle = 0; rtt = ""; min = ""
+      for (i = 1; i <= NF; i++) {
         n = index($i, ":"); if (!n) continue
         k = substr($i, 1, n - 1); v = substr($i, n + 1)
-        if (k == "lastrcv") idle = v
-        else if (k == "rtt") { split(v, r, "/"); rtt = r[1] }
-        else if (k == "minrtt") min = v
-      } }
-    END { if (idle != "") printf "%d %d\n", idle, rtt - min }'
+        # ss leaves lastrcv out when data arrived this very millisecond.
+        if (k == "lastrcv") idle = v + 0
+        else if (k == "rtt") { split(v, r, "/"); rtt = r[1] + 0 }
+        else if (k == "minrtt") min = v + 0
+      }
+      if (!found || idle < best) { found = 1; best = idle; queue = (rtt != "" && min != "") ? sprintf("%d", rtt - min) : "" }
+    }
+    END { if (found) print best, queue }'
 }
 
 # Prints "serialno ssid tx-mbps" for the phone, as far as it can tell, in
-# one round trip. tx-mbps is the speed Android estimates for its Wi-Fi uplink.
+# one round trip. tx-mbps is the speed Android estimates for its Wi-Fi
+# uplink. Only some phones say, so it's left out when unknown.
 phone_info() {
   adb -s "$1" shell 'getprop ro.serialno; cmd wifi status 2>/dev/null' 2>/dev/null | tr -d '\r' | awk '
     NR == 1 { serial = $0 }
-    /Wifi is connected to "/ { if (match($0, /"[^"]*"/)) ssid = substr($0, RSTART + 1, RLENGTH - 2) }
+    # The name runs to the last quote, since it can hold quotes itself.
+    /Wifi is connected to "/ {
+      s = substr($0, index($0, "connected to \"") + 14)
+      if (match(s, /.*"/)) ssid = substr(s, 1, RLENGTH - 1)
+    }
     /Calculated Tx *:/ { if (match($0, /Calculated Tx *: *[0-9]+/)) { t = substr($0, RSTART, RLENGTH); gsub(/[^0-9]/, "", t); tx = t } }
     END {
-      gsub(/[^A-Za-z0-9]/, "", serial); gsub(/[ \t]/, "_", ssid)
-      print (serial != "" ? serial : "unknown"), (ssid != "" ? ssid : "-"), (tx != "" ? tx : 0)
+      gsub(/[^A-Za-z0-9]/, "", serial); gsub(/[[:cntrl:]]/, "", ssid); gsub(/ /, "_", ssid)
+      print (serial != "" ? serial : "unknown"), (ssid != "" ? ssid : "-") (tx + 0 > 0 ? " " tx : "")
     }'
 }
 
@@ -1675,25 +1732,22 @@ detect_hevc() {
   out=$(timeout 30 scrcpy -s "$1" --list-encoders --no-audio 2>&1) || return 0
   grep -q -- '--video-codec=' <<<"$out" || return 0
   if grep -qE -- '--video-codec=h265 .*\(hw\)' <<<"$out"; then
-    echo yes >"$STATE_DIR/hevc.$2"
+    update_file "$STATE_DIR/hevc.$2" echo yes
   else
-    echo no >"$STATE_DIR/hevc.$2"
+    update_file "$STATE_DIR/hevc.$2" echo no
   fi
 }
 
-# The quality step that last kept up on a path and network, if any.
+# The quality step that last kept up on a path and network, if any. The key
+# goes through the environment: awk -v would read backslashes in a network's
+# name as escapes.
 quality_get() {
-  awk -v k="$1" '$1 == k { print $2; exit }' "$QUALITY_FILE" 2>/dev/null
+  K=$1 awk '$1 == ENVIRON["K"] { print $2; exit }' "$QUALITY_FILE" 2>/dev/null
 }
 
 quality_set() {
-  local tmp
-  tmp=$(mktemp)
-  {
-    awk -v k="$1" '$1 != k' "$QUALITY_FILE" 2>/dev/null
-    [[ -n ${2:-} ]] && echo "$1 $2"
-  } >"$tmp"
-  mv "$tmp" "$QUALITY_FILE"
+  K=$1 V=${2:-} update_file "$QUALITY_FILE" \
+    awk '$1 != ENVIRON["K"] { print } END { if (ENVIRON["V"] != "") print ENVIRON["K"], ENVIRON["V"] }'
 }
 
 # The quality step to start at, from how the phone is connected, how fast
@@ -1706,7 +1760,8 @@ start_tier() {
   tailscale) tier=3 ;;
   *) tier=1 ;;
   esac
-  if [[ $path != direct ]] && ((tx > 0)); then
+  # A tx of 0 means the phone didn't say how fast its Wi-Fi is.
+  if [[ $path != direct && $tx =~ ^[0-9]+$ ]] && ((tx > 0)); then
     if ((tx < 12)); then
       tier=$((tier + 2))
     elif ((tx < 25)); then
@@ -1721,10 +1776,11 @@ start_tier() {
 }
 
 # Sets ARGS to scrcpy's arguments for a window. Your own options come after
-# the automatic ones, so they win.
+# the automatic ones, so they win. A size of your own caps the mirror, which
+# lower quality steps can still make smaller.
 ARGS=()
 build_args() {
-  local kind=$1 pkg=$2 name=$3 serial=$4 tier=$5 hevc=$6 path wargs
+  local kind=$1 pkg=$2 name=$3 serial=$4 tier=$5 hevc=$6 path wargs size="" i
   path=$(path_of "$serial")
   mapfile -t wargs < <(window_args)
   ARGS=(-s "$serial")
@@ -1740,18 +1796,44 @@ build_args() {
     ARGS+=(--video-bit-rate="${TIER_RATES[tier]}" --max-fps="${TIER_FPS[tier]}")
     ((tier >= 2)) && [[ $hevc == yes ]] && ARGS+=(--video-codec=h265)
   fi
+  own_args "$kind" "$path"
+  ARGS+=("${OWN_ARGS[@]}")
 
-  ARGS+=("${COMMON_ARGS[@]}")
-  if [[ $kind == mirror ]]; then
-    ARGS+=("${MIRROR_ARGS[@]}")
-    [[ $ADAPT != off && -n ${TIER_MIRROR_SIZE[tier]} ]] && ARGS+=(--max-size="${TIER_MIRROR_SIZE[tier]}")
-  else
-    ARGS+=("${APP_ARGS[@]}")
+  if [[ $kind == mirror && $ADAPT != off && -n ${TIER_MIRROR_SIZE[tier]} ]]; then
+    for ((i = 0; i < ${#OWN_ARGS[@]}; i++)); do
+      case ${OWN_ARGS[i]} in
+      --max-size=*) size=${OWN_ARGS[i]#*=} ;;
+      -m?*) size=${OWN_ARGS[i]#-m} ;;
+      --max-size | -m) size=${OWN_ARGS[i + 1]:-} ;;
+      esac
+    done
+    [[ $size =~ ^[1-9][0-9]*$ ]] && ((size <= TIER_MIRROR_SIZE[tier])) ||
+      ARGS+=(--max-size="${TIER_MIRROR_SIZE[tier]}")
   fi
-  [[ $path == tailscale ]] && ARGS+=("${REMOTE_ARGS[@]}")
   # The phone's sound travels on its own connection (see "sound" above).
   ARGS+=(--no-audio)
   return 0
+}
+
+# Sets OWN_ARGS to your own scrcpy options for a window.
+OWN_ARGS=()
+own_args() {
+  OWN_ARGS=("${COMMON_ARGS[@]}")
+  if [[ $1 == mirror ]]; then OWN_ARGS+=("${MIRROR_ARGS[@]}"); else OWN_ARGS+=("${APP_ARGS[@]}"); fi
+  [[ $2 == tailscale ]] && OWN_ARGS+=("${REMOTE_ARGS[@]}")
+  return 0
+}
+
+# Whether your own options set the bit rate. A window then keeps the
+# quality it starts with, rather than stepping down when the link falls
+# behind.
+own_bit_rate() {
+  local arg
+  own_args "$1" "$2"
+  for arg in "${OWN_ARGS[@]}"; do
+    [[ $arg == --video-bit-rate* || $arg == -b* ]] && return 0
+  done
+  return 1
 }
 
 # A clearly better way to the same phone than the current one, if it's
@@ -1851,25 +1933,35 @@ end_scrcpy() {
 # app into the tile instead. The app starts only after that, so it never
 # sees a display it can turn.
 start_app_on_display() {
-  local serial=$1 pkg=$2 log=$3 pid=$4 id="" component _
-  for _ in {1..100}; do
+  local serial=$1 pkg=$2 log=$3 pid=$4 id="" component deadline=$((SECONDS + 60))
+  # The display can take a while over a slow link, the first time scrcpy's
+  # server is sent to the phone especially.
+  while :; do
     id=$(grep -oE 'New display: .*\(id=[0-9]+\)' "$log" 2>/dev/null | tail -1 | grep -oE '[0-9]+\)$' | tr -d ')')
     [[ -n $id ]] && break
-    kill -0 "$pid" 2>/dev/null || return 1
+    [[ -z $STOPPING ]] && kill -0 "$pid" 2>/dev/null || return 1
+    if ((SECONDS >= deadline)); then
+      log_event "no display after 60 s, $pkg not started"
+      return 1
+    fi
     sleep 0.1
   done
-  [[ -n $id ]] || return 1
 
-  adb -s "$serial" shell wm set-ignore-orientation-request -d "$id" true &>/dev/null ||
+  adb_timed 10 -s "$serial" shell wm set-ignore-orientation-request -d "$id" true &>/dev/null ||
     log_event "couldn't stop apps turning display $id"
 
-  component=$(adb -s "$serial" shell cmd package resolve-activity --brief \
-    -a android.intent.action.MAIN -c android.intent.category.LAUNCHER "$pkg" 2>/dev/null | tr -d '\r' | tail -1)
-  [[ $component == */* ]] ||
-    component=$(adb -s "$serial" shell cmd package resolve-activity --brief "$pkg" 2>/dev/null | tr -d '\r' | tail -1)
-  if [[ $component == */* ]]; then
-    adb -s "$serial" shell am start --display "$id" -a android.intent.action.MAIN \
-      -c android.intent.category.LAUNCHER -n "$component" &>/dev/null
+  # The app's first launcher activity, as its icon on the phone starts.
+  # Resolving one instead gives Android's chooser for an app with several.
+  component=$(adb_timed 10 -s "$serial" shell cmd package query-activities --components \
+    -a android.intent.action.MAIN -c android.intent.category.LAUNCHER "$pkg" 2>/dev/null | tr -d '\r' | grep -m1 /)
+  [[ $component == */* && $component != android/* ]] ||
+    component=$(adb_timed 10 -s "$serial" shell cmd package resolve-activity --brief \
+      -a android.intent.action.MAIN -c android.intent.category.LAUNCHER "$pkg" 2>/dev/null | tr -d '\r' | tail -1)
+  # adb hands the phone's shell one line to read, and Android doesn't check
+  # what an activity's name holds, so it goes quoted, and only a plain one.
+  if [[ $component =~ ^[A-Za-z0-9_.]+/[A-Za-z0-9_.$]+$ && $component != android/* ]]; then
+    adb_timed 10 -s "$serial" shell am start --display "$id" -a android.intent.action.MAIN \
+      -c android.intent.category.LAUNCHER -n "'$component'" &>/dev/null
   else
     log_event "no launcher activity for $pkg"
     return 1
@@ -1881,6 +1973,7 @@ session() {
   local app_id=phonelink log state path serialno ssid tx key hevc tier="" others code reason
   local host port idle queue shown=false ever_shown=false workspace="" address now last started
   local stall cong tick changed=0 lowered=false relaunch="" next="" error hevc_retry=true
+  local h264=false hevc_check=false own_rate=false save="" fails=0 quick was_shown resound=false
   local workspace_now limit=50 learned server every=10
   [[ $kind == app ]] && app_id="phonelink.$pkg"
   APP_ID=$app_id
@@ -1899,6 +1992,9 @@ session() {
     hevc=$(cat "$STATE_DIR/hevc.$serialno" 2>/dev/null)
     [[ -n $hevc || $serialno == unknown ]] ||
       (exec {SESSION_LOCK}>&-; detect_hevc "$serial" "$serialno" &>/dev/null &)
+    $h264 && hevc=no
+    own_rate=false
+    own_bit_rate "$kind" "$path" && own_rate=true
     # Backlog, in ms, that counts as falling behind. PHONELINK_QUEUE_LIMIT
     # overrides it for testing.
     limit=50
@@ -1919,34 +2015,56 @@ session() {
     fi
     build_args "$kind" "$pkg" "$name" "$serial" "$tier" "$hevc"
     $ever_shown && place_window "$app_id" "$workspace"
-    SDL_APP_ID="$app_id" scrcpy "${ARGS[@]}" >"$log" 2>&1 {SESSION_LOCK}>&- &
+    # Emptied before scrcpy starts, so the last run's display isn't taken
+    # for this one's.
+    : >"$log"
+    SDL_APP_ID="$app_id" scrcpy "${ARGS[@]}" >>"$log" 2>&1 {SESSION_LOCK}>&- &
     SCRCPY_PID=$!
+    started=$SECONDS
     log_event "start: $path $serial, quality step $((tier + 1)) (${TIER_RATES[tier]}bit/s), h265=${hevc:-unknown}, link ${tx:-?} Mbit/s, network $ssid"
     echo "up $path $tier" >"$state"
     [[ $kind == app ]] && start_app_on_display "$serial" "$pkg" "$log" "$SCRCPY_PID"
 
     read -r host port < <(transport_of "$serial")
-    server=$(adb_server_pid)
     reason="" shown=false stall=0 cong=0 tick=0
-    started=$SECONDS last=$(date +%s)
+    last=$(date +%s)
     while kill -0 "$SCRCPY_PID" 2>/dev/null && [[ -z $STOPPING ]]; do
       sleep 2 &
       wait $!
       [[ -n $STOPPING ]] && break
+      # Closed meanwhile, by the user say.
+      kill -0 "$SCRCPY_PID" 2>/dev/null || break
       tick=$((tick + 1))
       now=$(date +%s)
 
+      was_shown=$shown
       # Test sessions without a display count as shown once scrcpy is up.
-      [[ -n ${PHONELINK_HEADLESS:-} ]] && ((SECONDS - started > 4)) && shown=true ever_shown=true
+      [[ -n ${PHONELINK_HEADLESS:-} ]] && ((SECONDS - started > 4)) && shown=true
       if ! $shown || ((tick % 3 == 0)); then
         read -r address workspace_now < <(window_of "$app_id")
-        if [[ -n ${address:-} ]]; then
-          if ! $shown && $ever_shown; then
-            release_window_rule "$app_id"
-            [[ -n $relaunch ]] && session_note "Phone" "$relaunch"
-            relaunch=""
-          fi
-          shown=true ever_shown=true workspace=$workspace_now
+        [[ -n ${address:-} ]] && shown=true workspace=$workspace_now
+      fi
+      if $shown && ! $was_shown; then
+        if $ever_shown; then
+          release_window_rule "$app_id"
+          [[ -n $relaunch ]] && session_note "Phone" "$relaunch"
+        fi
+        relaunch="" ever_shown=true
+        # A lower step is remembered once it has worked, and H.265 given up
+        # on for the phone once H.264 has worked where it didn't.
+        if [[ -n $save ]]; then
+          quality_set "$key" "$save"
+          save=""
+        fi
+        if $hevc_check; then
+          update_file "$STATE_DIR/hevc.$serialno" echo no
+          log_event "H.264 works where H.265 didn't: H.264 from now on"
+          hevc_check=false
+        fi
+        # The sound may have given up while the window was away.
+        if $resound; then
+          resound=false
+          sound_window_opened "$(window_key "$app_id")" "$serial"
         fi
       fi
 
@@ -1960,21 +2078,24 @@ session() {
       last=$now
 
       if [[ -n $host ]] && $shown && ((SECONDS - started > 8)); then
+        # Read each time: adb's server may have restarted.
+        server=$(adb_server_pid)
         read -r idle queue < <(link_stats "$host" "$port" "$server")
         # The phone sends a frame at least every 100 ms, even of a still
-        # screen, so seconds without data means the link is gone.
-        if [[ -z ${idle:-} ]] || ((idle > 5000)); then
+        # screen, so seconds without data means the link is gone. Without a
+        # reading, it can't tell; scrcpy ends by itself if adb loses the link.
+        if [[ -n ${idle:-} ]] && ((idle > 5000)); then
           stall=$((stall + 1))
         else
           stall=0
         fi
         if ((stall >= 2)); then
           reason=stall
-          log_event "frozen: no data for ${idle:-?} ms"
+          log_event "frozen: no data for $idle ms"
           break
         fi
 
-        if [[ $ADAPT != off && -n ${queue:-} ]] && ((queue > limit)); then
+        if [[ $ADAPT != off && -n ${queue:-} ]] && ! $own_rate && ((queue > limit)); then
           cong=$((cong + 1))
         elif ((cong > 0)); then
           cong=$((cong - 1))
@@ -1996,7 +2117,11 @@ session() {
       fi
     done
 
-    [[ -n $reason ]] && end_scrcpy
+    # A scrcpy that ended by itself meanwhile, closed by the user say, has
+    # the last word.
+    if [[ -n $reason ]]; then
+      if kill -0 "$SCRCPY_PID" 2>/dev/null; then end_scrcpy; else reason=""; fi
+    fi
     wait "$SCRCPY_PID" 2>/dev/null
     code=$?
     SCRCPY_PID=""
@@ -2006,11 +2131,15 @@ session() {
     if grep -q "INJECT_EVENTS" "$log"; then
       session_note "$name" "Input blocked · Samsung: turn off Auto Blocker" normal
     fi
+    # H.264 failed too, so H.265 wasn't to blame.
+    $shown || hevc_check=false
+    quick=false
+    { ! $shown || ((SECONDS - started < 15)); } && quick=true
 
     case $reason in
     congested)
       tier=$((tier + 1))
-      quality_set "$key" "$tier"
+      save=$tier
       changed=$SECONDS
       if ! $lowered; then
         relaunch="Lower quality · keeping up"
@@ -2019,7 +2148,7 @@ session() {
       continue
       ;;
     upgrade)
-      serial=$next tier=""
+      serial=$next tier="" save=""
       relaunch="Now on $(path_label "$(path_of "$serial")")"
       continue
       ;;
@@ -2027,15 +2156,20 @@ session() {
     *)
       case $code in
       0) break ;;
-      2) ;;
-      1)
-        if ! $ever_shown; then
-          # A phone whose H.265 encoder lets it down gets H.264 from then on.
-          if $hevc_retry && [[ " ${ARGS[*]} " == *" --video-codec=h265 "* ]]; then
-            echo no >"$STATE_DIR/hevc.$serialno"
-            hevc_retry=false
-            continue
+      1 | 2)
+        # H.265 that never got a window up: H.264 from now on. The phone
+        # remembers that if its encoder was to blame, or once H.264 works.
+        if ! $shown && $hevc_retry && [[ " ${ARGS[*]} " == *" --video-codec=h265 "* ]]; then
+          hevc_retry=false h264=true
+          if grep -qiE 'ERROR:.*encod' "$log"; then
+            update_file "$STATE_DIR/hevc.$serialno" echo no
+          else
+            hevc_check=true
           fi
+          log_event "H.265 didn't start: trying H.264"
+          continue
+        fi
+        if ((code == 1)) && ! $ever_shown; then
           error=$(grep -E "ERROR:" "$log" | tail -1 | sed 's/.*ERROR: *//')
           session_note "$name couldn't start" "${error:-See $log}" normal
           break
@@ -2045,6 +2179,15 @@ session() {
       esac
       ;;
     esac
+
+    # Runs that keep ending at once would otherwise restart for ever.
+    if $quick; then fails=$((fails + 1)); else fails=0; fi
+    if ((fails >= 3)); then
+      error=$(grep -E "ERROR:" "$log" | tail -1 | sed 's/.*ERROR: *//')
+      log_event "giving up: $fails short runs in a row"
+      session_note "$name keeps failing" "${error:-See $log}" normal
+      break
+    fi
 
     # The link dropped or froze. Find the phone again, any way that works.
     if ((RECONNECT_SECS <= 0)); then
@@ -2061,11 +2204,13 @@ session() {
       session_note "Phone" "Couldn't reconnect · check Wireless debugging" normal
       break
     fi
-    serial=$RECONNECT_SERIAL tier=""
+    serial=$RECONNECT_SERIAL tier="" save="" resound=true
     log_event "reconnected: $serial"
     relaunch="Reconnected · $(path_label "$(path_of "$serial")")"
   done
 
+  # Two windows closing at once mustn't keep the sound for each other.
+  echo closing >"$state"
   # Quality that held up for ten minutes earns back a step next time.
   if [[ -n ${key:-} ]] && ! $lowered && ((SECONDS >= 600)); then
     learned=$(quality_get "$key")
@@ -2074,8 +2219,8 @@ session() {
     fi
   fi
   release_window_rule "$app_id"
-  rm -f "$state"
   sound_window_closed "$(window_key "$app_id")"
+  rm -f "$state"
 }
 
 # Runs scrcpy once under a phonelink app id, as earlier versions did for
@@ -2107,7 +2252,7 @@ open_app() {
     record_recent "$pkg"
     return
   fi
-  if session_running "phonelink.$pkg"; then
+  if session_running "phonelink.$pkg" && ! session_wait_closed "phonelink.$pkg"; then
     notify "Phone" "$name · reconnecting…"
     return 0
   fi
@@ -2131,7 +2276,7 @@ open_app() {
 mirror() {
   local serial label
   focus_class "phonelink" && return
-  if session_running "phonelink"; then
+  if session_running "phonelink" && ! session_wait_closed "phonelink"; then
     notify "Phone" "Mirror · reconnecting…"
     return 0
   fi
@@ -2472,9 +2617,17 @@ status() {
     [[ -f $f ]] || continue
     app=${f##*/session.}
     app=${app%.state}
+    # A session that was killed, or ran before a restart, leaves its file.
+    session_running "$app" || continue
     read -r state path tier <"$f"
+    [[ $state != closing && $tier =~ ^[0-9]+$ ]] || continue
     echo "Window $app: $state over $(path_label "$path"), quality step $((tier + 1)) of $((TIER_LAST + 1)) (${TIER_RATES[tier]}bit/s)"
   done
+  if [[ -n $(sound_session_pids) && -s $SOUND_STATE ]]; then
+    read -r state path <"$SOUND_STATE"
+    [[ $state == up ]] && state="playing here"
+    echo "Phone sound: $state over $(path_label "$path")"
+  fi
 }
 
 usage() {
@@ -2631,17 +2784,23 @@ phone_facts() {
 
 # Prints "rtt-ms best-rtt-ms bytes-received" for the adb server's
 # connection to an address.
+# Like link_stats, the socket that received last is the one in use.
 link_detail() {
   ss -tinpH state established "( dst $1 and dport = :$2 )" 2>/dev/null | awk -v want="pid=$3," '
-    /users:\(\(/ { mine = index($0, want) > 0; next }
-    mine { for (i = 1; i <= NF; i++) {
+    /^[^ \t]/ { mine = index($0, want) > 0; next }
+    mine {
+      mine = 0; idle = 0; rtt = ""; min = ""; rx = ""
+      for (i = 1; i <= NF; i++) {
         n = index($i, ":"); if (!n) continue
         k = substr($i, 1, n - 1); v = substr($i, n + 1)
-        if (k == "rtt") { split(v, r, "/"); rtt = r[1] }
+        if (k == "lastrcv") idle = v + 0
+        else if (k == "rtt") { split(v, r, "/"); rtt = r[1] }
         else if (k == "minrtt") min = v
         else if (k == "bytes_received") rx = v
-      } }
-    END { if (rx != "") printf "%.1f %.1f %s\n", rtt, min, rx }'
+      }
+      if (rx != "" && (!found || idle < best)) { found = 1; best = idle; out = sprintf("%.1f %.1f %s", rtt, min, rx) }
+    }
+    END { if (found) print out }'
 }
 
 # Live numbers for a connection, as JSON: round trip, backlog, and how fast
