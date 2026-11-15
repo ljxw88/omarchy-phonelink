@@ -33,7 +33,7 @@ MT7922 Wi-Fi card.
 ## What the installer changes
 
 It installs any missing packages (`scrcpy`, `android-tools`, `android-udev`,
-`qrencode`, `jq`), then:
+`qrencode`, `jq`, `iw`), then:
 
 - puts the `phonelink` command in `~/.local/bin`
 - adds `~/.config/hypr/phonelink.lua` (keybindings and window rules) and loads

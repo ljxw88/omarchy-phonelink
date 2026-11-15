@@ -32,8 +32,8 @@ plain words.
    them first with a graphical prompt:
 
    ```bash
-   pacman -Q scrcpy android-tools android-udev qrencode jq >/dev/null 2>&1 ||
-     pkexec pacman -S --needed --noconfirm scrcpy android-tools android-udev qrencode jq
+   pacman -Q scrcpy android-tools android-udev qrencode jq iw >/dev/null 2>&1 ||
+     pkexec pacman -S --needed --noconfirm scrcpy android-tools android-udev qrencode jq iw
    ```
 
 4. Run the installer as the user, not as root. Running it again is safe.

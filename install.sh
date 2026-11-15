@@ -11,7 +11,7 @@ CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/phonelink"
 STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/phonelink"
 MENU_FILE="$HOME/.config/omarchy/extensions/omarchy-menu.jsonc"
 PLUGIN_DIR="$HOME/.config/omarchy/plugins/phonelink.panel"
-PACKAGES=(scrcpy android-tools android-udev qrencode jq)
+PACKAGES=(scrcpy android-tools android-udev qrencode jq iw)
 
 # A line in hyprland.lua that loads phonelink, even commented out.
 REQUIRE_RE="require\s*\(?\s*[\"']hypr.phonelink[\"']"
