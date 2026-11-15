@@ -878,7 +878,7 @@ sound_pid() {
 sound_session_pids() {
   local d argv
   for d in /proc/[0-9]*; do
-    mapfile -d '' -t argv <"$d/cmdline" 2>/dev/null || continue
+    mapfile -d '' -t argv 2>/dev/null <"$d/cmdline" || continue
     [[ ${argv[2]:-} == __sound && ${argv[1]:-} == */phonelink ]] && echo "${d#/proc/}"
   done
   return 0
@@ -910,20 +910,20 @@ foreign_sound_pids() {
 
 # Windows on screen, plus window sessions still running, which includes ones
 # opening or reconnecting their window. Only used to decide when the sound
-# can go back to the phone. A session asking leaves itself out.
+# can go back to the phone. $1 leaves out a window that's closing: its
+# session is still running while it asks.
 live_window_keys() {
-  local pid argv
+  local leave=${1:-} pid argv
   {
     open_window_keys
     for pid in $(session_pids); do
-      [[ $pid == "$$" ]] && continue
-      mapfile -d '' -t argv <"/proc/$pid/cmdline" 2>/dev/null || continue
+      mapfile -d '' -t argv 2>/dev/null <"/proc/$pid/cmdline" || continue
       case ${argv[3]:-} in
       mirror) echo mirror ;;
       app) [[ -n ${argv[4]:-} ]] && echo "${argv[4]}" ;;
       esac
     done
-  } | sort -u
+  } | sort -u | grep -vxF -- "${leave:-//none//}" || true
 }
 
 # Ends the sound session and its scrcpy, and waits until both have.
@@ -1095,9 +1095,10 @@ sound_window_opened() {
   sound_unlock
 }
 
+# $1 is the window that closed.
 sound_window_closed() {
   sound_lock || return 0
-  [[ -z $(live_window_keys) ]] && sound_stop
+  [[ -z $(live_window_keys "${1:-}") ]] && sound_stop
   sound_unlock
 }
 
@@ -1206,7 +1207,7 @@ launch_lock() {
 session_pids() {
   local d argv
   for d in /proc/[0-9]*; do
-    mapfile -d '' -t argv <"$d/cmdline" 2>/dev/null || continue
+    mapfile -d '' -t argv 2>/dev/null <"$d/cmdline" || continue
     [[ ${argv[2]:-} == __session && ${argv[1]:-} == */phonelink ]] && echo "${d#/proc/}"
   done
   return 0
@@ -1651,7 +1652,7 @@ session() {
   fi
   release_window_rule "$app_id"
   rm -f "$state"
-  sound_window_closed
+  sound_window_closed "$(window_key "$app_id")"
 }
 
 # Runs scrcpy once under a phonelink app id, as earlier versions did for
