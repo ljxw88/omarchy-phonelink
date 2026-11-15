@@ -6,6 +6,8 @@ and keyboard. Works over Wi-Fi, USB, or Tailscale when you're away from home.
 The video quality follows your connection, and windows reconnect by
 themselves when the network changes. Nothing to install on the phone.
 
+![The phone panel](docs/images/panel.png)
+
 ## Install
 
 Paste this into your AI coding agent (Claude Code, OpenCode, Codex…):
@@ -36,9 +38,10 @@ Samsung: if debugging is greyed out or the mouse doesn't work, turn off
 
 ## Use
 
-Click the **phone icon** in the bar. Tiles open the mirror or an app; the
-buttons along the top show the network, the direct link, the Phone menu and
-disconnect.
+Click the **phone icon** in the bar. Its network button shows how the
+computer reaches the phone:
+
+![The network map](docs/images/network.png)
 
 | Shortcut | |
 |---|---|
