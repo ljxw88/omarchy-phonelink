@@ -159,6 +159,36 @@ tile_size() {
 
 # ---------------------------------------------------------------- devices
 
+# adb, without phonelink's lock files. When its server isn't running, adb
+# starts one in the background, and that server would hold any lock it
+# inherited for as long as it runs: a window could never open again, or the
+# sound never come back. LAUNCH_LOCK, SOUND_LOCK and SESSION_LOCK are set
+# while held.
+adb() {
+  if [[ -z ${LAUNCH_LOCK:-}${SOUND_LOCK:-}${SESSION_LOCK:-} ]]; then
+    command adb "$@"
+    return
+  fi
+  (
+    [[ -n ${LAUNCH_LOCK:-} ]] && exec {LAUNCH_LOCK}>&-
+    [[ -n ${SOUND_LOCK:-} ]] && exec {SOUND_LOCK}>&-
+    [[ -n ${SESSION_LOCK:-} ]] && exec {SESSION_LOCK}>&-
+    exec adb "$@"
+  )
+}
+
+# adb with a time limit, the same way.
+adb_timed() {
+  local secs=$1
+  shift
+  (
+    [[ -n ${LAUNCH_LOCK:-} ]] && exec {LAUNCH_LOCK}>&-
+    [[ -n ${SOUND_LOCK:-} ]] && exec {SOUND_LOCK}>&-
+    [[ -n ${SESSION_LOCK:-} ]] && exec {SESSION_LOCK}>&-
+    exec timeout "$secs" adb "$@"
+  )
+}
+
 # Every device adb knows, emulators included.
 all_devices() {
   adb devices 2>/dev/null | awk 'NR > 1 && $2 == "device" { print $1 }'
@@ -179,11 +209,11 @@ connect_wireless() {
   local addr
   # Phones with Wireless debugging on announce themselves over mDNS.
   while read -r addr; do
-    [[ -n $addr ]] && timeout 4 adb connect "$addr" &>/dev/null
+    [[ -n $addr ]] && adb_timed 4 connect "$addr" &>/dev/null
   done < <(adb mdns services 2>/dev/null | awk '/_adb-tls-connect/ { print $NF }')
 
   # Phones switched to Wi-Fi with `phonelink wifi`.
-  [[ -s $TCP_FILE ]] && timeout 4 adb connect "$(<"$TCP_FILE")" &>/dev/null
+  [[ -s $TCP_FILE ]] && adb_timed 4 connect "$(<"$TCP_FILE")" &>/dev/null
   sleep 0.5
 }
 
@@ -211,7 +241,7 @@ tailnet_devices() {
 # Whether the phone answers on this connection. A connection from before a
 # network change can still be listed as connected while leading nowhere.
 phone_alive() {
-  timeout 4 adb -s "$1" shell true &>/dev/null
+  adb_timed 4 -s "$1" shell true &>/dev/null
 }
 
 # Whether a running scrcpy uses this connection.
@@ -386,7 +416,7 @@ tailnet_address() {
 # adb's own answer is the only sure sign it reached the phone.
 adb_connect() {
   local _
-  timeout 6 adb connect "$1" 2>/dev/null | grep -q "connected to" || return 1
+  adb_timed 6 connect "$1" 2>/dev/null | grep -q "connected to" || return 1
   for _ in {1..10}; do
     all_devices | grep -qxF "$1" && return 0
     sleep 0.3
@@ -459,7 +489,7 @@ direct_serial() {
   local addr
   [[ -s $DIRECT_FILE ]] && direct_link_up || return 1
   addr=$(<"$DIRECT_FILE")
-  ready_devices | grep -qxF "$addr" || timeout 4 adb connect "$addr" &>/dev/null
+  ready_devices | grep -qxF "$addr" || adb_timed 4 connect "$addr" &>/dev/null
   ready_devices | grep -qxF "$addr" || return 1
   printf '%s' "$addr"
 }
@@ -928,17 +958,24 @@ live_window_keys() {
 
 # Ends the sound session and its scrcpy, and waits until both have.
 sound_stop() {
-  local pid _
+  local pid helpers alive _
   sound_here || return 0
   if [[ -n ${PHONELINK_DRY_RUN:-} ]]; then
     echo "sound: stop"
     return
   fi
+  # scrcpy's adb helper keeps the phone capturing until it exits, and a new
+  # capture can't start while it does.
+  helpers=$(for pid in $(sound_pids); do pgrep -P "$pid"; done)
   for pid in $(sound_session_pids) $(sound_pids); do
     kill -TERM "$pid" 2>/dev/null
   done
   for _ in {1..40}; do
-    sound_here || return 0
+    alive=false
+    for pid in $helpers; do
+      kill -0 "$pid" 2>/dev/null && alive=true
+    done
+    ! $alive && ! sound_here && return 0
     sleep 0.1
   done
   # Still running after 4 seconds. scrcpy's adb child would keep the phone
@@ -946,7 +983,7 @@ sound_stop() {
   for pid in $(sound_pids); do
     pkill -KILL -P "$pid" 2>/dev/null
   done
-  for pid in $(sound_session_pids) $(sound_pids); do
+  for pid in $(sound_session_pids) $(sound_pids) $helpers; do
     kill -KILL "$pid" 2>/dev/null
   done
   sleep 0.2
@@ -994,13 +1031,11 @@ sound_start() {
 # connection when one turns up. It ends when stopped, or when no phone window
 # is left to want the sound.
 sound_session() {
-  local serial=$1 log path args code reason next started tick now last error up=false
+  local serial=$1 log path args code reason next started tick now last error up=false tries=0
   APP_ID=$SOUND_ID
   log="$LOG_DIR/$SOUND_ID.log"
   local state="$STATE_DIR/session.$SOUND_ID.state"
 
-  exec {SESSION_LOCK}>"$STATE_DIR/session.$SOUND_ID.lock"
-  flock -n "$SESSION_LOCK" || exit 0
   trap 'STOPPING=1; end_scrcpy' TERM INT HUP
 
   while [[ -z $STOPPING ]]; do
@@ -1051,6 +1086,13 @@ sound_session() {
     fi
     ((code == 0)) && break
     if ((code == 1)) && ! $up; then
+      # The phone may still be letting go of the last capture; try again.
+      if ((tries < 2)); then
+        tries=$((tries + 1))
+        sleep 1 &
+        wait $!
+        continue
+      fi
       error=$(grep -E "ERROR:" "$log" | tail -1 | sed 's/.*ERROR: *//')
       notify -u normal "Phone sound stays on the phone" "${error:-It could not be played here. See $log}"
       break
@@ -1497,7 +1539,7 @@ session() {
     fi
     build_args "$kind" "$pkg" "$name" "$serial" "$tier" "$hevc"
     $ever_shown && place_window "$app_id" "$workspace"
-    SDL_APP_ID="$app_id" scrcpy "${ARGS[@]}" >"$log" 2>&1 &
+    SDL_APP_ID="$app_id" scrcpy "${ARGS[@]}" >"$log" 2>&1 {SESSION_LOCK}>&- &
     SCRCPY_PID=$!
     log_event "start: $path $serial, quality step $((tier + 1)) (${TIER_RATES[tier]}bit/s), h265=${hevc:-unknown}, link ${tx:-?} Mbit/s, network $ssid"
     echo "up $path $tier" >"$state"
