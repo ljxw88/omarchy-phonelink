@@ -116,20 +116,29 @@ Panel {
     else if (row.kind === "pair") run(["pair"])
   }
 
-  // The sound setting of a mirror or app row: "pc" or "phone".
-  function soundOf(row) {
-    if (!row) return ""
-    if (row.kind === "mirror") return mirrorSound
-    if (row.kind === "app") return row.app.sound
-    return ""
+  // Phone windows share one sound, so an open window's row shows where it
+  // plays now. A row for a window that isn't open shows where it will play
+  // when that window opens. "pc", "phone", or "" for other rows.
+  function rowIsOpen(row) {
+    if (!row) return false
+    if (row.kind === "mirror") return mirrorOpen
+    if (row.kind === "app") return appOpen(row.app.package)
+    return false
   }
 
-  // Shows the new setting at once, then lets phonelink apply it.
+  function soundOf(row) {
+    if (!row || (row.kind !== "mirror" && row.kind !== "app")) return ""
+    if (rowIsOpen(row)) return sound
+    return row.kind === "mirror" ? mirrorSound : row.app.sound
+  }
+
+  // Shows the change at once, then lets phonelink make it.
   function toggleSound(row) {
     var current = soundOf(row)
     if (current === "") return
     var next = current === "pc" ? "phone" : "pc"
     var key = row.kind === "mirror" ? "mirror" : row.app.package
+    if (rowIsOpen(row)) sound = next
     if (row.kind === "mirror") {
       mirrorSound = next
     } else {
@@ -487,6 +496,7 @@ Panel {
 
     readonly property string iconPath: kind === "app" ? rowData.app.icon : ""
     readonly property string soundSetting: root.soundOf(rowData)
+    readonly property bool windowOpen: root.rowIsOpen(rowData)
 
     readonly property string title: kind === "mirror" ? strings.t("mirror")
       : kind === "app" ? rowData.app.name
@@ -615,7 +625,9 @@ Panel {
           anchors.right: parent.right
           anchors.verticalCenter: parent.verticalCenter
           iconText: row.soundSetting === "pc" ? "󰽟" : "󰥒"
-          tooltipText: row.soundSetting === "pc" ? strings.t("soundPcTip") : strings.t("soundPhoneTip")
+          tooltipText: row.windowOpen
+            ? (row.soundSetting === "pc" ? strings.t("soundPcTip") : strings.t("soundPhoneTip"))
+            : (row.soundSetting === "pc" ? strings.t("soundPcNextTip") : strings.t("soundPhoneNextTip"))
           foreground: root.bar.foreground
           fontFamily: root.bar.fontFamily
           onClicked: root.toggleSound(row.rowData)

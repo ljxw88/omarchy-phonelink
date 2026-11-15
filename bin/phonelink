@@ -719,13 +719,16 @@ is_pinned() {
 
 # Android mixes every app's sound into one output, so a phone window can't
 # carry just its own. One hidden, sound-only connection carries the phone's
-# sound for all windows instead, and the windows carry none. It runs while any
-# open phone window is set to play its sound here ("pc"), and stops when none
-# is, which hands the sound back to the phone. Each window's setting is
-# remembered, under "mirror" or the app's package name.
+# sound instead, and the windows carry none. While it runs, the sound plays
+# here; without it, on the phone.
+#
+# Each window remembers where its sound should play, under "mirror" or the
+# app's package name. Opening a window set to this computer brings the sound
+# here. Switching a window moves the sound at once, and since every window
+# shares it, for all of them. When the last phone window closes, the sound
+# goes back to the phone.
 SOUND_ID="phonelink-sound"
 SOUND_PREFS="$STATE_DIR/sound"
-STOPPING_FILE="$STATE_DIR/stopping"
 
 # The setting key for a phonelink window id or class, if it is one.
 window_key() {
@@ -735,11 +738,22 @@ window_key() {
   esac
 }
 
+# Prints "key<TAB>pid" for each phone window on screen. A scrcpy without a
+# window (one still starting, or a test run) doesn't count.
+open_windows() {
+  local class pid
+  while IFS=$'\t' read -r class pid; do
+    printf '%s\t%s\n' "$(window_key "$class")" "$pid"
+  done < <(hyprctl clients -j 2>/dev/null |
+    jq -r '.[] | select(.class | test("^phonelink(\\..+)?$")) | "\(.class)\t\(.pid)"')
+}
+
 open_window_keys() {
-  local id
-  while IFS=$'\t' read -r _ id; do
-    window_key "$id"
-  done < <(phonelink_processes)
+  open_windows | cut -f1 | sort -u
+}
+
+is_open() {
+  open_window_keys | grep -qxF "$1"
 }
 
 sound_pref() {
@@ -758,6 +772,10 @@ set_sound_pref() {
 
 sound_pid() {
   phonelink_processes | awk -F'\t' -v id="$SOUND_ID" '$2 == id { print $1; exit }'
+}
+
+sound_here() {
+  [[ -n $(sound_pid) ]]
 }
 
 # The device a running scrcpy was started for.
@@ -794,31 +812,31 @@ sound_start() {
   spawn "$SOUND_ID" "Phone sound" "${args[@]}"
 }
 
-# Puts the phone's sound where the open windows want it. $1 names a window
-# that's starting and may not be running yet, $2 the device it uses.
-sound_apply() {
-  local starting=${1:-} serial=${2:-} key want=phone pid
-  # While phonelink stop closes the windows, the ones closing mustn't start
-  # the sound again. Opening a window ends that.
-  if [[ -n $starting ]]; then
-    rm -f "$STOPPING_FILE"
-  elif [[ -n $(find "$STOPPING_FILE" -newermt '-20 seconds' 2>/dev/null) ]]; then
-    return 0
-  fi
-  while read -r key; do
-    [[ -n $key && $(sound_pref "$key") == pc ]] && want=pc
-  done < <(open_window_keys; [[ -n $starting ]] && echo "$starting")
-
-  if [[ $want == phone ]]; then
+# Moves the phone's sound to "pc" or "phone" now. $2 is the device to use,
+# by default the one an open phone window uses.
+sound_to() {
+  local serial=${2:-} pid
+  if [[ $1 == phone ]]; then
     sound_stop
     return
   fi
   if [[ -z $serial ]]; then
-    [[ -n $(sound_pid) ]] && return 0
-    pid=$(phonelink_processes | awk -F'\t' -v id="$SOUND_ID" '$2 != id { print $1; exit }')
+    pid=$(open_windows | head -1 | cut -f2)
     [[ -n $pid ]] && serial=$(process_serial "$pid")
   fi
   [[ -n $serial ]] && sound_start "$serial"
+  return 0
+}
+
+# A window set to this computer brings the sound here. One set to the phone
+# leaves it where it is, so it doesn't silence the others.
+sound_window_opened() {
+  [[ $(sound_pref "$1") == pc ]] && sound_to pc "$2"
+  return 0
+}
+
+sound_window_closed() {
+  [[ -z $(open_window_keys) ]] && sound_stop
   return 0
 }
 
@@ -827,9 +845,10 @@ sound_label() {
 }
 
 # phonelink sound [pc|phone|toggle] [mirror|<package>]
-# Without a window named, it's the focused phone window, or else every open one.
+# Without a window named, it's the focused phone window, or else all of them.
+# A window that isn't open only remembers the setting for next time.
 sound_cmd() {
-  local mode=${1:-toggle} key=${2:-} keys=() k new others
+  local mode=${1:-toggle} key=${2:-} keys=() k new open=false title body
   [[ $mode =~ ^(pc|phone|toggle)$ ]] || die "Usage: phonelink sound [pc|phone|toggle] [mirror|<package>]"
 
   if [[ -z $key ]]; then
@@ -838,38 +857,39 @@ sound_cmd() {
   if [[ -n $key ]]; then
     [[ $key == mirror ]] || valid_pkg "$key" || die "Not a phone window: $key"
     keys=("$key")
+    is_open "$key" && open=true
+    title=$(sound_label "$key")
   else
-    mapfile -t keys < <(open_window_keys | sort -u)
+    mapfile -t keys < <(open_window_keys)
     ((${#keys[@]})) || die "Open a phone app or the mirror first, then switch its sound."
+    open=true
+    title="Phone sound"
   fi
 
   new=$mode
   if [[ $mode == toggle ]]; then
-    if ((${#keys[@]} == 1)); then
-      [[ $(sound_pref "${keys[0]}") == pc ]] && new=phone || new=pc
+    if $open; then
+      if sound_here; then new=phone; else new=pc; fi
     else
-      [[ -n $(sound_pid) ]] && new=phone || new=pc
+      if [[ $(sound_pref "$key") == pc ]]; then new=phone; else new=pc; fi
     fi
   fi
   for k in "${keys[@]}"; do
     set_sound_pref "$k" "$new"
   done
-  sound_apply
 
-  if ((${#keys[@]} > 1)); then
-    [[ $new == pc ]] && notify "Phone sound" "Playing on this computer." || notify "Phone sound" "Playing on the phone."
-  elif [[ $new == pc ]]; then
-    notify "$(sound_label "$key")" "Sound plays on this computer."
-  else
-    others=$(open_window_keys | sort -u | while read -r k; do
-      [[ $k != "$key" && $(sound_pref "$k") == pc ]] && sound_label "$k"
-    done | paste -sd, - | sed 's/,/, /g')
-    if [[ -n $others ]]; then
-      notify "$(sound_label "$key")" "Set to the phone. The sound stays here while $others is set to play on this computer."
-    else
-      notify "$(sound_label "$key")" "Sound plays on the phone."
-    fi
+  if ! $open; then
+    [[ $new == pc ]] && body="Opens with its sound on this computer." || body="Opens with its sound on the phone."
+    notify "$title" "$body"
+    return
   fi
+
+  sound_to "$new"
+  [[ $new == pc ]] && body="Sound now plays on this computer." || body="Sound now plays on the phone."
+  if (($(open_window_keys | wc -l) > 1)); then
+    body+=" Phone windows share one sound, so this goes for all of them."
+  fi
+  notify "$title" "$body"
 }
 
 # ---------------------------------------------------------------- launching
@@ -933,7 +953,7 @@ run_scrcpy() {
     fi
     return
   fi
-  sound_apply
+  sound_window_closed
 
   if grep -q "INJECT_EVENTS" "$log"; then
     notify -u normal "$label" "The phone blocked mouse and keyboard input. Samsung: turn off Settings › Security and privacy › Auto Blocker. Xiaomi: turn on Developer options › USB debugging (Security settings)."
@@ -966,7 +986,7 @@ open_app() {
   args+=(--no-audio)
 
   spawn "phonelink.$pkg" "$name" "${args[@]}"
-  sound_apply "$pkg" "$serial"
+  sound_window_opened "$pkg" "$serial"
   [[ -n ${PHONELINK_DRY_RUN:-} ]] && return
   warn_if_relayed "$serial"
 
@@ -990,7 +1010,7 @@ mirror() {
   args+=(--no-audio)
 
   spawn "phonelink" "$label" "${args[@]}"
-  sound_apply mirror "$serial"
+  sound_window_opened mirror "$serial"
   [[ -n ${PHONELINK_DRY_RUN:-} ]] && return
   warn_if_relayed "$serial"
   wait_for_window "phonelink"
@@ -1208,7 +1228,6 @@ disconnect() {
   local pid serial
   # Close the phone windows phonelink opened and the sound connection, then
   # drop the Wi-Fi links.
-  touch "$STOPPING_FILE"
   while IFS=$'\t' read -r pid _; do
     kill "$pid" 2>/dev/null
   done < <(phonelink_processes)

@@ -29,5 +29,7 @@
   "pairCaption": "Over Wi-Fi with a QR code",
   "statusSoundHere": "%1 · sound here",
   "soundPcTip": "Sound plays on this computer. Click to play it on the phone (S)",
-  "soundPhoneTip": "Sound plays on the phone. Click to play it on this computer (S)"
+  "soundPhoneTip": "Sound plays on the phone. Click to play it on this computer (S)",
+  "soundPcNextTip": "Opens with its sound on this computer. Click to use the phone (S)",
+  "soundPhoneNextTip": "Opens with its sound on the phone. Click to use this computer (S)"
 }

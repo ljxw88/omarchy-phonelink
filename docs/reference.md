@@ -86,17 +86,21 @@ The mirror keeps the phone's shape inside its tile.
 
 ## Sound
 
-Each phone app and the mirror has its own sound setting: **on this computer**
-(the default) or **on the phone**. Switch it with **Super + Alt + V** in the
-window, or with the speaker button on its row in the bar panel. phonelink
-remembers the setting for that app.
+Switch a phone window's sound between **this computer** (the default) and
+**the phone** with **Super + Alt + V** in the window, or with the speaker
+button on its row in the bar panel. The sound moves right away.
 
-Android mixes every app's sound into one output, so the sound can't be split
-by app. phonelink plays the phone's sound on this computer while any open phone
-window is set to it. When none is, or the last phone window closes, the sound
-goes back to the phone.
+Android mixes every app's sound into one output, so phone windows share one
+sound: switching one moves it for all open phone windows. Each app and the
+mirror remembers its setting, and opening a window set to this computer brings
+the sound here. Opening one set to the phone leaves the sound where it is.
+When the last phone window closes, the sound goes back to the phone.
 
-While it plays here, the phone's speaker is silent. The sound goes to this
+In the bar panel, an open window's speaker button shows where the sound plays
+now. For an app that isn't open, it shows where its sound will play when it
+opens.
+
+While the sound plays here, the phone's speaker is silent. It goes to this
 computer's current output, as set in Omarchy's audio panel.
 
 ## Commands
