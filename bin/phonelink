@@ -2125,7 +2125,7 @@ status() {
 usage() {
   sed -n '3p' "$SELF" | sed 's/^# //'
   echo
-  grep -E '^#   phonelink' "$SELF" | sed 's/^# //'
+  awk '/^#   phonelink/ { on = 1 } on && !/^#  / { exit } on { sub(/^# /, ""); print }' "$SELF"
 }
 
 # Checks for the adb server without starting it: starting it would reconnect
