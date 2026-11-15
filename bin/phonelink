@@ -770,12 +770,32 @@ set_sound_pref() {
   mv "$tmp" "$SOUND_PREFS"
 }
 
+# One change to the phone's sound at a time. The sound connection starts in
+# the background, so without this a quick second switch could miss it and
+# start another, and the sound would play twice.
+SOUND_LOCK=""
+sound_lock() {
+  exec {SOUND_LOCK}>"$STATE_DIR/sound.lock"
+  flock -w "${1:-15}" "$SOUND_LOCK" && return 0
+  sound_unlock
+  return 1
+}
+
+sound_unlock() {
+  [[ -n $SOUND_LOCK ]] && exec {SOUND_LOCK}>&-
+  SOUND_LOCK=""
+}
+
+sound_pids() {
+  phonelink_processes | awk -F'\t' -v id="$SOUND_ID" '$2 == id { print $1 }'
+}
+
 sound_pid() {
-  phonelink_processes | awk -F'\t' -v id="$SOUND_ID" '$2 == id { print $1; exit }'
+  sound_pids | head -1
 }
 
 sound_here() {
-  [[ -n $(sound_pid) ]]
+  [[ -n $(sound_pids) ]]
 }
 
 # The device a running scrcpy was started for.
@@ -783,37 +803,89 @@ process_serial() {
   tr '\0' '\n' <"/proc/$1/cmdline" 2>/dev/null | awk 'prev == "-s" { print; exit } { prev = $0 }'
 }
 
+# Other scrcpy runs that play a phone's sound here, such as one started by
+# hand or by an older phonelink. Starting the sound connection beside one
+# would play the sound twice.
+foreign_sound_pids() {
+  local pid args
+  for pid in $(pgrep -x scrcpy); do
+    tr '\0' '\n' <"/proc/$pid/environ" 2>/dev/null | grep -qxF "SDL_APP_ID=$SOUND_ID" && continue
+    args=$(tr '\0' '\n' <"/proc/$pid/cmdline" 2>/dev/null) || continue
+    grep -qxE -- '--no-audio|--no-audio-playback|--otg|--list-[a-z-]+|--version|--help|-[hv]' <<<"$args" && continue
+    echo "$pid"
+  done
+  return 0
+}
+
+# Windows on screen, plus window processes young enough to be still opening
+# theirs. Only used to decide when the sound can go back to the phone.
+live_window_keys() {
+  local pid id
+  {
+    open_window_keys
+    while IFS=$'\t' read -r pid id; do
+      [[ $id == "$SOUND_ID" ]] && continue
+      (($(ps -o etimes= -p "$pid" 2>/dev/null || echo 99) < 15)) && window_key "$id"
+    done < <(phonelink_processes)
+  } | sort -u
+}
+
+# Ends every sound connection, and waits until each has.
 sound_stop() {
   local pid _
-  pid=$(sound_pid)
-  [[ -n $pid ]] || return 0
+  [[ -n $(sound_pids) ]] || return 0
   if [[ -n ${PHONELINK_DRY_RUN:-} ]]; then
     echo "sound: stop"
     return
   fi
-  kill "$pid" 2>/dev/null
-  # Two sound connections at once would fight over the phone's audio.
-  for _ in {1..20}; do
-    kill -0 "$pid" 2>/dev/null || return 0
+  for pid in $(sound_pids); do
+    kill "$pid" 2>/dev/null
+  done
+  for _ in {1..30}; do
+    [[ -z $(sound_pids) ]] && return 0
     sleep 0.1
   done
+  # Still running after 3 seconds. Its adb child would keep the phone
+  # capturing, so it goes too.
+  for pid in $(sound_pids); do
+    pkill -KILL -P "$pid" 2>/dev/null
+    kill -KILL "$pid" 2>/dev/null
+  done
+  sleep 0.2
 }
 
+# Starts exactly one sound connection for the device, and waits until it runs.
 sound_start() {
-  local serial=$1 pid args
-  pid=$(sound_pid)
-  if [[ -n $pid ]]; then
-    [[ $(process_serial "$pid") == "$serial" ]] && return 0
+  local serial=$1 pids foreign args _
+  pids=$(sound_pids)
+  if [[ -n $pids ]]; then
+    [[ $pids != *$'\n'* && $(process_serial "$pids") == "$serial" ]] && return 0
     sound_stop
   fi
+
+  foreign=$(foreign_sound_pids)
+  if [[ -n $foreign ]]; then
+    notify -u normal "Phone sound stays on the phone" \
+      "Another scrcpy (process ${foreign//$'\n'/, }) is already playing a phone's sound here. Close it and switch again, so the sound doesn't play twice."
+    return 1
+  fi
+
   args=(-s "$serial" --no-video --no-control --no-window --require-audio)
   # Tailscale paths jitter more, and a bigger buffer keeps sound from crackling.
   is_tailnet_serial "$serial" && args+=(--audio-buffer=150)
   spawn "$SOUND_ID" "Phone sound" "${args[@]}"
+  [[ -n ${PHONELINK_DRY_RUN:-} ]] && return 0
+
+  for _ in {1..50}; do
+    sound_here && return 0
+    sleep 0.1
+  done
+  notify -u normal "Phone sound stays on the phone" "The sound connection didn't start. See $LOG_DIR/$SOUND_ID.log"
+  return 1
 }
 
 # Moves the phone's sound to "pc" or "phone" now. $2 is the device to use,
-# by default the one an open phone window uses.
+# by default the one an open phone window uses. Call with the lock held.
 sound_to() {
   local serial=${2:-} pid
   if [[ $1 == phone ]]; then
@@ -824,20 +896,26 @@ sound_to() {
     pid=$(open_windows | head -1 | cut -f2)
     [[ -n $pid ]] && serial=$(process_serial "$pid")
   fi
-  [[ -n $serial ]] && sound_start "$serial"
-  return 0
+  if [[ -z $serial ]]; then
+    notify -u normal "Phone sound stays on the phone" "Couldn't tell which connection the phone window uses."
+    return 1
+  fi
+  sound_start "$serial"
 }
 
 # A window set to this computer brings the sound here. One set to the phone
 # leaves it where it is, so it doesn't silence the others.
 sound_window_opened() {
-  [[ $(sound_pref "$1") == pc ]] && sound_to pc "$2"
-  return 0
+  [[ $(sound_pref "$1") == pc ]] || return 0
+  sound_lock || return 0
+  sound_to pc "$2"
+  sound_unlock
 }
 
 sound_window_closed() {
-  [[ -z $(open_window_keys) ]] && sound_stop
-  return 0
+  sound_lock || return 0
+  [[ -z $(live_window_keys) ]] && sound_stop
+  sound_unlock
 }
 
 sound_label() {
@@ -848,7 +926,7 @@ sound_label() {
 # Without a window named, it's the focused phone window, or else all of them.
 # A window that isn't open only remembers the setting for next time.
 sound_cmd() {
-  local mode=${1:-toggle} key=${2:-} keys=() k new open=false title body
+  local mode=${1:-toggle} key=${2:-} keys=() k new now open=false title body
   [[ $mode =~ ^(pc|phone|toggle)$ ]] || die "Usage: phonelink sound [pc|phone|toggle] [mirror|<package>]"
 
   if [[ -z $key ]]; then
@@ -866,6 +944,8 @@ sound_cmd() {
     title="Phone sound"
   fi
 
+  sound_lock || die "Another change to the phone's sound is taking too long. Try again in a moment."
+
   new=$mode
   if [[ $mode == toggle ]]; then
     if $open; then
@@ -879,12 +959,18 @@ sound_cmd() {
   done
 
   if ! $open; then
+    sound_unlock
     [[ $new == pc ]] && body="Opens with its sound on this computer." || body="Opens with its sound on the phone."
     notify "$title" "$body"
     return
   fi
 
   sound_to "$new"
+  if sound_here; then now=pc; else now=phone; fi
+  sound_unlock
+
+  # sound_start has already said why if the sound couldn't come here.
+  [[ $now == "$new" ]] || return 1
   [[ $new == pc ]] && body="Sound now plays on this computer." || body="Sound now plays on the phone."
   if (($(open_window_keys | wc -l) > 1)); then
     body+=" Phone windows share one sound, so this goes for all of them."
@@ -910,12 +996,12 @@ spawn() {
   else
     runner=(setsid -f "$SELF" __run "$@")
   fi
-  # The window mustn't hold the launch lock for as long as it's open.
-  if [[ -n $LAUNCH_LOCK ]]; then
-    "${runner[@]}" &>/dev/null {LAUNCH_LOCK}>&-
-  else
-    "${runner[@]}" &>/dev/null
-  fi
+  # What it starts mustn't hold phonelink's locks for as long as it runs.
+  (
+    [[ -n $LAUNCH_LOCK ]] && exec {LAUNCH_LOCK}>&-
+    [[ -n $SOUND_LOCK ]] && exec {SOUND_LOCK}>&-
+    exec "${runner[@]}" &>/dev/null
+  )
 }
 
 # A phone window takes a few seconds to appear. Opening the same one again
@@ -1227,10 +1313,12 @@ connect() {
 disconnect() {
   local pid serial
   # Close the phone windows phonelink opened and the sound connection, then
-  # drop the Wi-Fi links.
+  # drop the Wi-Fi links. A sound change in progress finishes first.
+  sound_lock
   while IFS=$'\t' read -r pid _; do
     kill "$pid" 2>/dev/null
   done < <(phonelink_processes)
+  sound_unlock
   direct_disconnect
   rm -f "$TCP_FILE"
   adb_running || {
@@ -1327,16 +1415,19 @@ status_json() {
     done | jq -R -s 'split("\n") | map(select(length > 0) | split("\t")
       | { package: .[0], name: .[1], icon: .[2], pinned: (.[3] == "1"), open: (.[4] == "1"), sound: .[5] })'
   )
-  # A sound connection with no window left (one that crashed, say) would keep
-  # the phone silent; the bar's regular check ends it. A young one may belong
-  # to a window that's still starting.
-  pid=$(sound_pid)
-  if [[ -n $pid ]]; then
-    if [[ -z $(open_window_keys) ]] && (($(ps -o etimes= -p "$pid" 2>/dev/null || echo 0) > 10)); then
+  # Read where the sound is between changes, never halfway through one. A
+  # sound connection with no window left (one that crashed, say) would keep
+  # the phone silent, so the bar's regular check ends it. A young one may
+  # belong to a window that's still opening.
+  if sound_lock 5; then
+    pid=$(sound_pid)
+    if [[ -n $pid && -z $(live_window_keys) ]] && (($(ps -o etimes= -p "$pid" 2>/dev/null || echo 0) > 10)); then
       sound_stop
-    else
-      sound=pc
     fi
+    sound_here && sound=pc
+    sound_unlock
+  else
+    sound_here && sound=pc
   fi
 
   jq -n --arg via "$via" --arg name "$name" --argjson direct "$direct" --argjson supported "$supported" \

@@ -36,6 +36,20 @@ Panel {
   // carries its setting in `apps`.
   property string sound: "phone"
   property string mirrorSound: "pc"
+
+  // Sound switches clicked here wait in `soundQueue` and run one at a time, in
+  // order. Until a status check that started after the last of them comes
+  // back, the buttons show what was clicked (`expectedPrefs` per window,
+  // `expectedNow` for where the sound plays), so an older status reply can't
+  // flip a button back and make the next click send the opposite.
+  property var soundQueue: []
+  property var expectedPrefs: ({})
+  property string expectedNow: ""
+  property real soundDoneAt: 0
+  property real statusStartedAt: 0
+  property bool refreshQueued: false
+  property bool queuedBrief: true
+  readonly property string effectiveSound: expectedNow !== "" ? expectedNow : sound
   property string deviceName: ""
   property bool directUp: false
   property bool directSupported: false
@@ -64,7 +78,7 @@ Panel {
     : strings.t("notConnected")
 
   readonly property string statusLabel: !loaded ? strings.t("checking")
-    : connected && sound === "pc" ? strings.t("statusSoundHere").arg(viaLabel)
+    : connected && effectiveSound === "pc" ? strings.t("statusSoundHere").arg(viaLabel)
     : viaLabel
 
   readonly property string tooltip: connected
@@ -126,33 +140,47 @@ Panel {
     return false
   }
 
+  function rowKey(row) {
+    return row.kind === "mirror" ? "mirror" : row.app.package
+  }
+
   function soundOf(row) {
     if (!row || (row.kind !== "mirror" && row.kind !== "app")) return ""
-    if (rowIsOpen(row)) return sound
+    if (rowIsOpen(row)) return effectiveSound
+    var key = rowKey(row)
+    if (expectedPrefs[key] !== undefined) return expectedPrefs[key]
     return row.kind === "mirror" ? mirrorSound : row.app.sound
   }
 
-  // Shows the change at once, then lets phonelink make it.
   function toggleSound(row) {
     var current = soundOf(row)
     if (current === "") return
     var next = current === "pc" ? "phone" : "pc"
-    var key = row.kind === "mirror" ? "mirror" : row.app.package
-    if (rowIsOpen(row)) sound = next
-    if (row.kind === "mirror") {
-      mirrorSound = next
-    } else {
-      var list = apps.slice()
-      for (var i = 0; i < list.length; i++) {
-        if (list[i].package !== key) continue
-        var copy = {}
-        for (var k in list[i]) copy[k] = list[i][k]
-        copy.sound = next
-        list[i] = copy
-      }
-      apps = list
+    var key = rowKey(row)
+
+    var prefs = {}
+    for (var k in expectedPrefs) prefs[k] = expectedPrefs[k]
+    prefs[key] = next
+    expectedPrefs = prefs
+    if (rowIsOpen(row)) expectedNow = next
+
+    // Each switch names its result, so a later one for the same window
+    // replaces an earlier one still waiting.
+    var queue = soundQueue.filter(function(item) { return item.key !== key })
+    queue.push({ key: key, next: next })
+    soundQueue = queue
+    if (!soundProcess.running) runNextSound()
+  }
+
+  function runNextSound() {
+    if (soundQueue.length === 0) {
+      soundDoneAt = Date.now()
+      refresh(!opened)
+      return
     }
-    soundProcess.command = [root.command, "sound", next, key]
+    var item = soundQueue[0]
+    soundQueue = soundQueue.slice(1)
+    soundProcess.command = [root.command, "sound", item.next, item.key]
     soundProcess.running = true
   }
 
@@ -207,8 +235,15 @@ Panel {
 
   // --- status ----------------------------------------------------------------
 
+  // A check asked for while one runs follows it rather than being dropped,
+  // so the state after a change is always read after the change.
   function refresh(brief) {
-    if (statusProcess.running) return
+    if (statusProcess.running) {
+      queuedBrief = refreshQueued ? (queuedBrief && brief) : brief
+      refreshQueued = true
+      return
+    }
+    statusStartedAt = Date.now()
     statusProcess.command = brief
       ? [root.command, "status", "--json", "--brief"]
       : [root.command, "status", "--json"]
@@ -251,7 +286,8 @@ Panel {
       directSupported: !!data.directSupported,
       apps: list,
       sound: data.sound === "pc" ? "pc" : "phone",
-      mirrorSound: data.mirrorSound === "phone" ? "phone" : "pc"
+      mirrorSound: data.mirrorSound === "phone" ? "phone" : "pc",
+      startedAt: statusStartedAt
     }
     var items = copies()
     for (var j = 0; j < items.length; j++)
@@ -269,6 +305,13 @@ Panel {
     sound = status.sound
     mirrorSound = status.mirrorSound
     loaded = true
+
+    // The switches clicked here are done and this check began after them, so
+    // it shows their result: stop showing the clicks and show the state.
+    if (soundQueue.length === 0 && !soundProcess.running && soundDoneAt > 0 && status.startedAt >= soundDoneAt) {
+      expectedPrefs = ({})
+      expectedNow = ""
+    }
   }
 
   property string _statusText: ""
@@ -284,6 +327,11 @@ Panel {
     }
     onExited: function(exitCode) {
       if (exitCode === 0) root.parseStatus(String(statusOut.text || root._statusText || ""))
+      if (root.refreshQueued) {
+        var brief = root.queuedBrief
+        root.refreshQueued = false
+        Qt.callLater(function() { root.refresh(brief) })
+      }
     }
   }
 
@@ -291,7 +339,7 @@ Panel {
     id: soundProcess
     running: false
     command: []
-    onExited: root.refresh(!root.opened)
+    onExited: Qt.callLater(root.runNextSound)
   }
 
   Process {
