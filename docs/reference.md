@@ -9,6 +9,7 @@
 - [Commands](#commands)
 - [Settings](#settings)
 - [The direct Wi-Fi link](#the-direct-wi-fi-link)
+- [Away from home (Tailscale)](#away-from-home-tailscale)
 - [Troubleshooting](#troubleshooting)
 - [Privacy](#privacy)
 
@@ -19,6 +20,8 @@
 - For the direct Wi-Fi link: NetworkManager with wpa_supplicant (iwd can't do
   Wi-Fi Direct), and a Wi-Fi card that supports Wi-Fi Direct alongside a normal
   connection. Without these, phonelink goes through your router instead.
+- For use away from home: [Tailscale](https://tailscale.com) on the computer
+  and the phone, on the same tailnet.
 
 Tested with a Samsung Galaxy Z Fold (Android 17) and a laptop with a MediaTek
 MT7922 Wi-Fi card.
@@ -86,7 +89,8 @@ phonelink open <pkg>   Open one phone app in its own window
 phonelink mirror       Mirror and control the whole phone screen
 phonelink pin          Choose which phone apps appear in the app launcher
 phonelink pair         Pair over Wi-Fi with a QR code
-phonelink connect      Connect to a paired phone
+phonelink connect      Connect to a paired phone, nearby or over Tailscale
+phonelink connect <port>  Reach the phone over Tailscale at this Wireless debugging port
 phonelink direct       Link straight to the phone with Wi-Fi Direct
 phonelink direct off   Drop the direct link
 phonelink wifi         Switch a USB-connected phone to Wi-Fi
@@ -106,6 +110,9 @@ phonelink status       Show connected phones
 | `APP_DPI` | `200` | Size of the UI in app windows; higher is bigger |
 | `KEYBOARD` | `uhid` | `uhid` gives the phone a real keyboard, so its own keyboard app handles languages such as Chinese |
 | `SERIAL` | | Use this phone when several are connected |
+| `TAILSCALE` | `auto` | `off` never reaches the phone over Tailscale |
+| `TAILSCALE_HOST` | | The phone's Tailscale name, if phonelink can't work it out |
+| `REMOTE_ARGS` | `(--video-bit-rate=4M --max-fps=30)` | Extra scrcpy options over Tailscale |
 | `MIRROR_ARGS` | `(--max-size=1600)` | Extra scrcpy options for the mirror |
 | `APP_ARGS` | | Extra scrcpy options for app windows |
 | `COMMON_ARGS` | `(--video-bit-rate=10M)` | Extra scrcpy options for both |
@@ -124,6 +131,38 @@ seconds. The phone needs to be unlocked. It briefly shows its Wi-Fi Direct page,
 and phonelink taps Connect on the invitation for you. If that tap doesn't
 happen, tap Connect yourself.
 
+## Away from home (Tailscale)
+
+When the phone isn't nearby, phonelink reaches it over Tailscale. Nearby
+connections always come first, so at home nothing changes.
+
+**What it needs:**
+
+- Tailscale running on the computer and the phone, on the same tailnet.
+- The phone on Wi-Fi with Wireless debugging on. Android turns Wireless
+  debugging off on mobile data. Any Wi-Fi network works, not just yours.
+
+**How phonelink finds the phone:** whenever the phone connects nearby,
+phonelink notes its Tailscale address and Wireless debugging port. If it has
+never seen the phone, it uses the tailnet's only Android device, or
+`TAILSCALE_HOST` from the config.
+
+**When the port changes:** Wireless debugging picks a new port each time it's
+turned on, including after the phone changes Wi-Fi network. Then phonelink asks
+for the port shown under **Wireless debugging › IP address & port**. You can
+also give it directly with `phonelink connect <port>`.
+
+**On mobile data:** before you leave, plug the phone in and run `phonelink wifi`.
+The phone then listens on port 5555 until it restarts, on any network,
+including mobile data. phonelink tries that port over Tailscale. A computer the
+phone hasn't allowed before has to be approved on the phone's screen.
+
+**Speed:** video is lighter over Tailscale (`REMOTE_ARGS`), and the direct Wi-Fi
+link is off, since the phone isn't nearby. How smooth it is depends on the
+upload speed where the phone is. If Tailscale can't make a direct connection
+and relays traffic through its servers, phonelink warns you, and the bar shows
+"Tailscale · relayed". Expect lag then.
+
 ## Troubleshooting
 
 - **No phone found.** Check that Wireless debugging is on. Android turns it off
@@ -134,6 +173,9 @@ happen, tap Connect yourself.
   is the fastest option.
 - **The direct link won't connect.** Keep the phone unlocked and nearby while
   it's set up.
+- **Can't reach the phone away from home.** Check that the Tailscale app on the
+  phone is connected, the phone is on Wi-Fi, and Wireless debugging is on. Then
+  run `phonelink connect <port>` with the port the phone shows.
 - **A black window.** Some apps, such as banking apps and Netflix, block screen
   capture.
 - **Sound plays in only one window.** That's deliberate: only the first phone

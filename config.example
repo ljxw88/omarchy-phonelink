@@ -25,3 +25,12 @@
 # Mirror resolution cap, in pixels on the long side. Lower is snappier over Wi-Fi.
 # Add --turn-screen-off to keep the phone's own screen dark while mirroring:
 # MIRROR_ARGS=(--max-size=1600)
+
+# Away from home, reach the phone over Tailscale when both are on the same
+# tailnet (auto), or never (off).
+# TAILSCALE="auto"
+# The phone's Tailscale name, if phonelink can't work it out (for example with
+# several Android devices on the tailnet):
+# TAILSCALE_HOST="my-phone"
+# Lighter video over Tailscale, where bandwidth is usually lower:
+# REMOTE_ARGS=(--video-bit-rate=4M --max-fps=30)

@@ -31,6 +31,7 @@ Panel {
   property bool loaded: false
   property bool connected: false
   property string via: "none"
+  property bool relayed: false
   property string deviceName: ""
   property bool directUp: false
   property bool directSupported: false
@@ -55,6 +56,7 @@ Panel {
   readonly property string viaLabel: via === "direct" ? strings.t("viaDirect")
     : via === "usb" ? strings.t("viaUsb")
     : via === "wifi" ? strings.t("viaWifi")
+    : via === "tailscale" ? (relayed ? strings.t("viaTailscaleRelayed") : strings.t("viaTailscale"))
     : strings.t("notConnected")
 
   readonly property string statusLabel: !loaded ? strings.t("checking") : viaLabel
@@ -69,7 +71,8 @@ Panel {
     var list = [{ kind: "mirror", group: 0 }]
     for (var i = 0; i < apps.length; i++) list.push({ kind: "app", group: 1, app: apps[i] })
     list.push({ kind: "all", group: 1 })
-    if (directSupported) list.push({ kind: "direct", group: 2 })
+    // The direct link needs the phone nearby, so it's no use over Tailscale.
+    if (directSupported && via !== "tailscale") list.push({ kind: "direct", group: 2 })
     if (connected) {
       list.push({ kind: "disconnect", group: 2 })
     } else {
@@ -194,7 +197,8 @@ Panel {
 
     var status = {
       connected: !!data.connected,
-      via: ["direct", "wifi", "usb"].indexOf(data.via) >= 0 ? data.via : "none",
+      via: ["direct", "wifi", "usb", "tailscale"].indexOf(data.via) >= 0 ? data.via : "none",
+      relayed: !!data.relayed,
       name: typeof data.name === "string" ? data.name.slice(0, 80) : "",
       direct: !!data.direct,
       directSupported: !!data.directSupported,
@@ -208,6 +212,7 @@ Panel {
   function applyStatus(status) {
     connected = status.connected
     via = status.via
+    relayed = status.relayed
     if (status.name !== "") deviceName = status.name
     directUp = status.direct
     directSupported = status.directSupported

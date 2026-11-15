@@ -8,7 +8,8 @@
 #   phonelink mirror       Mirror and control the whole phone screen
 #   phonelink pin          Choose which phone apps appear in the app launcher
 #   phonelink pair         Pair over Wi-Fi with a QR code (Android 11+)
-#   phonelink connect      Connect to a paired phone
+#   phonelink connect      Connect to a paired phone, nearby or over Tailscale
+#   phonelink connect <port>  Reach the phone over Tailscale at this Wireless debugging port
 #   phonelink direct       Link straight to the phone with Wi-Fi Direct (faster)
 #   phonelink direct off   Drop the direct link
 #   phonelink wifi         Switch a USB-connected phone to Wi-Fi
@@ -22,6 +23,9 @@
 # Over Wi-Fi, video normally travels phone → router → laptop. When the phone is
 # only on Wi-Fi, phonelink sets up a Wi-Fi Direct link (the kind Smart View
 # uses) straight between the two, while both stay on the home network.
+#
+# Away from home, phonelink reaches the phone over Tailscale when both are on
+# the same tailnet.
 #
 # https://github.com/ljxw88/omarchy-phonelink
 
@@ -38,6 +42,7 @@ DIRECT_FILE="$STATE_DIR/direct-addr"
 DIRECT_PEER_FILE="$STATE_DIR/direct-peer"
 DIRECT_FAIL_FILE="$STATE_DIR/direct-failed"
 DIRECT_CON="phonelink-direct"
+TAILNET_FILE="$STATE_DIR/tailnet"
 DESKTOP_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/applications"
 ICON_ROOT="${XDG_DATA_HOME:-$HOME/.local/share}/icons/hicolor"
 ICON_DIR="$ICON_ROOT/256x256/apps"
@@ -51,6 +56,9 @@ APP_DPI=200                        # app window density; higher makes the app UI
 APP_ARGS=(--no-vd-system-decorations --keep-active)
 MIRROR_ARGS=(--max-size=1600)
 COMMON_ARGS=(--video-bit-rate=10M)
+TAILSCALE="auto"                   # auto = reach the phone over Tailscale when it isn't nearby, off = never
+TAILSCALE_HOST=""                  # the phone's Tailscale name or address, if phonelink can't work it out
+REMOTE_ARGS=(--video-bit-rate=4M --max-fps=30)  # extra scrcpy options over Tailscale
 
 # shellcheck source=/dev/null
 [[ -f $CONFIG_FILE ]] && source "$CONFIG_FILE"
@@ -166,34 +174,68 @@ connect_wireless() {
   sleep 0.5
 }
 
+# Phones reachable nearby: on USB, over the direct link while it's up, or
+# through the router. A direct link that dropped can stay listed for a while.
+nearby_devices() {
+  local stale="" d
+  direct_link_up || stale=$(cat "$DIRECT_FILE" 2>/dev/null)
+  while read -r d; do
+    [[ -n $d ]] || continue
+    is_tailnet_serial "$d" && continue
+    [[ -n $stale && $d == "$stale" ]] && continue
+    echo "$d"
+  done < <(ready_devices)
+}
+
+tailnet_devices() {
+  local d
+  while read -r d; do
+    [[ -n $d ]] && is_tailnet_serial "$d" && echo "$d"
+  done < <(ready_devices)
+  return 0
+}
+
 # Prints the serial of the phone to use: USB first, then the direct Wi-Fi
-# link, then the router. With "direct", sets up the direct link if it's down.
+# link, then the router, then Tailscale. With "direct", sets up the direct
+# link if it's down.
 pick_device() {
-  local want_direct=${1:-} devices serial direct
+  local want_direct=${1:-} nearby serial direct
   adb start-server &>/dev/null
 
   if [[ -n $SERIAL ]]; then
-    all_devices | grep -qxF "$SERIAL" || connect_wireless
+    if ! all_devices | grep -qxF "$SERIAL"; then
+      [[ $SERIAL == *:* ]] && adb_connect "$SERIAL"
+      connect_wireless
+    fi
     all_devices | grep -qxF "$SERIAL" || die "Phone $SERIAL isn't connected."
     printf '%s' "$SERIAL"
     return
   fi
 
-  devices=$(ready_devices)
-  if [[ -z $devices ]]; then
+  nearby=$(nearby_devices)
+  if [[ -z $nearby ]]; then
     connect_wireless
-    devices=$(ready_devices)
+    nearby=$(nearby_devices)
   fi
 
-  if [[ -z $devices ]]; then
+  if [[ -z $nearby ]]; then
+    serial=$(tailnet_devices | head -1)
+    if [[ -z $serial ]] && connect_tailscale; then
+      serial=$REMOTE_SERIAL
+    fi
+    if [[ -n $serial ]]; then
+      printf '%s' "$serial"
+      return
+    fi
     if adb devices 2>/dev/null | grep -q $'\tunauthorized'; then
       die "Unlock your phone and tap Allow on the USB debugging prompt."
     fi
-    die "No phone found. Plug it in with USB debugging on, or pair it over Wi-Fi from the Phone menu."
+    die "${REMOTE_ERROR:-No phone found. Turn on Wireless debugging, plug the phone in, or pair it from the Phone menu.}"
   fi
 
-  serial=$(usb_devices <<<"$devices" | head -1)
+  serial=$(usb_devices <<<"$nearby" | head -1)
   if [[ -n $serial ]]; then
+    learn_tailnet "$serial" &>/dev/null &
     printf '%s' "$serial"
     return
   fi
@@ -203,13 +245,9 @@ pick_device() {
     return
   fi
 
-  # A direct link that dropped can still be listed for a while; skip it.
-  serial=$(grep -vxF "$(cat "$DIRECT_FILE" 2>/dev/null)" <<<"$devices" | head -1)
-  if [[ -z $serial ]]; then
-    connect_wireless
-    serial=$(ready_devices | grep -vxF "$(cat "$DIRECT_FILE" 2>/dev/null)" | head -1)
-    [[ -n $serial ]] || die "No phone found. Check that Wireless debugging is on, or pair it from the Phone menu."
-  fi
+  serial=$(grep -vxF "$(cat "$DIRECT_FILE" 2>/dev/null)" <<<"$nearby" | head -1)
+  [[ -n $serial ]] || serial=$(head -1 <<<"$nearby")
+  learn_tailnet "$serial" &>/dev/null &
 
   if [[ $want_direct == direct && $DIRECT == auto && -n $(p2p_device) ]] && direct_allowed; then
     if direct=$(direct_connect_locked "$serial"); then
@@ -220,6 +258,121 @@ pick_device() {
     notify "Phone" "Couldn't set up the direct link, so this goes through your Wi-Fi router."
   fi
   printf '%s' "$serial"
+}
+
+# ---------------------------------------------------------------- Tailscale
+
+tailscale_enabled() {
+  [[ $TAILSCALE != off ]] && command -v tailscale &>/dev/null
+}
+
+# Tailscale gives every device an address in 100.64.0.0/10.
+is_tailnet_ip() {
+  local a b
+  IFS=. read -r a b _ <<<"$1"
+  [[ $a == 100 && $b =~ ^[0-9]+$ ]] && ((b >= 64 && b <= 127))
+}
+
+is_tailnet_serial() {
+  is_tailnet_ip "${1%:*}"
+}
+
+# The tailnet's entry for the device at this address, if it's on the tailnet.
+tailnet_peer() {
+  tailscale status --json 2>/dev/null |
+    jq -c --arg ip "$1" 'first(.Peer[]? | select(.TailscaleIPs | index($ip))) // empty'
+}
+
+# While the phone is nearby, note its Tailscale address and its Wireless
+# debugging port, so it can be reached from elsewhere later. Mobile carriers
+# hand out addresses in Tailscale's range too, so only an address the tailnet
+# knows counts.
+learn_tailnet() {
+  local serial=$1 ip port old=""
+  tailscale_enabled || return 0
+  port=$(adb_port "$serial")
+  [[ -s $TAILNET_FILE ]] && old=$(<"$TAILNET_FILE")
+  [[ -n $port ]] || port=${old#* }
+  while read -r ip; do
+    is_tailnet_ip "$ip" && [[ -n $(tailnet_peer "$ip") ]] || continue
+    [[ "$ip $port" == "$old" ]] || echo "$ip $port" >"$TAILNET_FILE"
+    return 0
+  done < <(adb -s "$serial" shell ip -4 -o addr show 2>/dev/null | awk '{ sub(/\/.*/, "", $4); print $4 }')
+}
+
+# The phone's Tailscale address: the one set in TAILSCALE_HOST, the one it
+# reported while nearby, or the tailnet's only Android device.
+tailnet_address() {
+  local ip=""
+  if [[ -n $TAILSCALE_HOST ]]; then
+    if is_tailnet_ip "$TAILSCALE_HOST"; then
+      ip=$TAILSCALE_HOST
+    else
+      ip=$(tailscale ip -4 "$TAILSCALE_HOST" 2>/dev/null | head -1)
+    fi
+  elif [[ -s $TAILNET_FILE ]]; then
+    read -r ip _ <"$TAILNET_FILE"
+  else
+    ip=$(tailscale status --json 2>/dev/null | jq -r '[.Peer[]? | select(.OS == "android")]
+      | if length == 1 then (.[0].TailscaleIPs[] | select(startswith("100."))) else empty end')
+  fi
+  [[ -n $ip ]] && printf '%s' "$ip"
+}
+
+# adb's own answer is the only sure sign it reached the phone.
+adb_connect() {
+  local _
+  timeout 6 adb connect "$1" 2>/dev/null | grep -q "connected to" || return 1
+  for _ in {1..10}; do
+    all_devices | grep -qxF "$1" && return 0
+    sleep 0.3
+  done
+  return 1
+}
+
+# Reaches the phone over Tailscale. On success sets REMOTE_SERIAL; otherwise
+# sets REMOTE_ERROR to what the user can do about it.
+REMOTE_SERIAL=""
+REMOTE_ERROR=""
+connect_tailscale() {
+  local ip peer port="" p
+  tailscale_enabled || return 1
+  ip=$(tailnet_address) || return 1
+  peer=$(tailnet_peer "$ip")
+  [[ -n $peer ]] || return 1
+  if [[ $(jq -r '.Online' <<<"$peer") != true ]]; then
+    REMOTE_ERROR="Your phone is offline on Tailscale. Open the Tailscale app on the phone and check it's connected."
+    return 1
+  fi
+
+  [[ -s $TAILNET_FILE ]] && read -r _ port <"$TAILNET_FILE"
+  for p in $port 5555; do
+    if adb_connect "$ip:$p"; then
+      REMOTE_SERIAL="$ip:$p"
+      return 0
+    fi
+  done
+
+  # Wireless debugging picks a new port each time it's turned on, and only
+  # the phone's screen shows it.
+  if [[ -z ${PHONELINK_NO_PROMPT:-} ]] && command -v omarchy-menu-input &>/dev/null; then
+    p=$(omarchy-menu-input "Phone on Tailscale: turn on Wireless debugging, then enter the port it shows" --width 640) || p=""
+    if [[ $p =~ ^[0-9]+$ ]] && ((p > 0 && p < 65536)) && adb_connect "$ip:$p"; then
+      echo "$ip $p" >"$TAILNET_FILE"
+      REMOTE_SERIAL="$ip:$p"
+      return 0
+    fi
+  fi
+  REMOTE_ERROR="Your phone is on Tailscale, but Wireless debugging didn't answer. Turn it on (the phone needs Wi-Fi), then run: phonelink connect <port shown on the phone>"
+  return 1
+}
+
+# True when Tailscale relays traffic to this address through its servers
+# instead of a direct path, which adds lag.
+tailnet_relayed() {
+  local last
+  last=$(tailscale ping -c 5 --timeout 2s "$1" 2>/dev/null | grep '^pong' | tail -1)
+  [[ $last == *"via DERP"* ]]
 }
 
 # ---------------------------------------------------------------- direct Wi-Fi link
@@ -439,6 +592,7 @@ direct() {
     [[ -n $(p2p_device) ]] || die "This computer can't do Wi-Fi Direct. It needs NetworkManager with wpa_supplicant and a Wi-Fi card that supports it."
     serial=$(pick_device) || exit 1
     [[ $serial == *:* || $serial == *_adb-tls-connect* ]] || die "Your phone is on USB, which is already the fastest link."
+    is_tailnet_serial "$serial" && die "Your phone is connected over Tailscale. The direct link only works when it's next to this computer."
     rm -f "$DIRECT_FAIL_FILE"
     if direct=$(direct_connect_locked "$serial"); then
       notify "Phone" "Direct link is up. Phone windows now skip your Wi-Fi router."
@@ -636,10 +790,12 @@ open_app() {
   mapfile -t wargs < <(window_args)
   args=(-s "$serial" --new-display="$(tile_size)/$APP_DPI" --flex-display --start-app="$pkg"
     --window-title="$name" "${wargs[@]}" "${COMMON_ARGS[@]}" "${APP_ARGS[@]}")
+  is_tailnet_serial "$serial" && args+=("${REMOTE_ARGS[@]}")
   audio_busy && args+=(--no-audio)
 
   spawn "phonelink.$pkg" "$name" "${args[@]}"
   [[ -n ${PHONELINK_DRY_RUN:-} ]] && return
+  warn_if_relayed "$serial"
 
   # Only an app that actually opened becomes recent.
   wait_for_window "phonelink.$pkg" || return 0
@@ -657,10 +813,23 @@ mirror() {
   label=$(device_label "$serial")
   mapfile -t wargs < <(window_args)
   args=(-s "$serial" --window-title="$label" "${wargs[@]}" "${COMMON_ARGS[@]}" "${MIRROR_ARGS[@]}")
+  is_tailnet_serial "$serial" && args+=("${REMOTE_ARGS[@]}")
   audio_busy && args+=(--no-audio)
 
   spawn "phonelink" "$label" "${args[@]}"
+  [[ -n ${PHONELINK_DRY_RUN:-} ]] && return
+  warn_if_relayed "$serial"
   wait_for_window "phonelink"
+}
+
+# Checks the Tailscale path in the background, once the window is on its way.
+warn_if_relayed() {
+  is_tailnet_serial "$1" || return 0
+  (
+    exec {LAUNCH_LOCK}>&-
+    tailnet_relayed "${1%:*}" &&
+      notify -u normal "Phone over Tailscale" "Tailscale is relaying this connection through its servers, so expect lag. It often finds a direct path within a minute."
+  ) &>/dev/null &
 }
 
 choose_app() {
@@ -834,10 +1003,31 @@ wifi() {
   fi
 }
 
+# With no argument, finds the phone nearby or over Tailscale. With a port,
+# reaches it over Tailscale at that Wireless debugging port; with an
+# address and port, connects there.
 connect() {
-  local serial
-  serial=$(pick_device) || exit 1
-  notify "Phone" "Connected to $(device_label "$serial")."
+  local target=${1:-} serial ip
+  if [[ -z $target ]]; then
+    serial=$(pick_device) || exit 1
+  else
+    adb start-server &>/dev/null
+    if [[ $target =~ ^[0-9]+$ ]]; then
+      tailscale_enabled || die "Tailscale isn't installed, or TAILSCALE is off in your phonelink config."
+      ip=$(tailnet_address) || die "Couldn't find your phone on Tailscale. Set TAILSCALE_HOST in ~/.config/phonelink/config to its Tailscale name."
+      target="$ip:$target"
+    fi
+    [[ $target =~ ^[A-Za-z0-9._-]+:[0-9]+$ ]] || die "Give a port, or an address and port such as 100.101.102.103:41234."
+    adb_connect "$target" || die "Couldn't connect to $target. Check that Wireless debugging is on and shows that port."
+    is_tailnet_serial "$target" && echo "${target%:*} ${target##*:}" >"$TAILNET_FILE"
+    serial=$target
+  fi
+
+  if is_tailnet_serial "$serial"; then
+    notify "Phone" "Connected to $(device_label "$serial") over Tailscale."
+  else
+    notify "Phone" "Connected to $(device_label "$serial")."
+  fi
 }
 
 disconnect() {
@@ -868,6 +1058,7 @@ disconnect() {
 }
 
 status() {
+  local ip port
   adb start-server &>/dev/null
   echo "Connected phones:"
   adb devices -l | tail -n +2 | grep . || echo "  none"
@@ -875,6 +1066,12 @@ status() {
     echo "Direct link: up ($(<"$DIRECT_FILE"))"
   else
     echo "Direct link: down"
+  fi
+  if [[ -s $TAILNET_FILE ]]; then
+    read -r ip port <"$TAILNET_FILE"
+    echo "Tailscale: $ip, Wireless debugging port ${port:-unknown}"
+  elif tailscale_enabled; then
+    echo "Tailscale: not seen yet (connect the phone nearby once)"
   fi
   [[ -s $APPS_CACHE ]] && echo "Cached apps: $(wc -l <"$APPS_CACHE")"
 }
@@ -888,29 +1085,30 @@ usage() {
 # Checks for the adb server without starting it: starting it would reconnect
 # a phone the user just disconnected.
 adb_running() {
-  ss -Hltn 'sport = :5037' 2>/dev/null | grep -q .
+  ss -Hltn "sport = :${ANDROID_ADB_SERVER_PORT:-5037}" 2>/dev/null | grep -q .
 }
 
 # State for the bar widget, as JSON. --brief skips asking the phone its name.
 status_json() {
-  local via=none serial="" name="" direct=false supported=false mirror=false devices classes apps pkg icon f
+  local via=none serial="" name="" direct=false supported=false mirror=false relayed=false nearby classes apps pkg icon f
   [[ -n $(p2p_device) ]] && supported=true
   direct_link_up && direct=true
 
   if adb_running; then
-    devices=$(ready_devices)
-    if [[ -n $devices ]]; then
-      serial=$(usb_devices <<<"$devices" | head -1)
-      if [[ -n $serial ]]; then
-        via=usb
-      elif serial=$(direct_serial); then
-        via=direct
-      else
-        serial=$(head -1 <<<"$devices")
-        via=wifi
-      fi
-      [[ ${1:-} == --brief ]] || name=$(device_label "$serial")
+    nearby=$(nearby_devices)
+    if serial=$(usb_devices <<<"$nearby" | head -1) && [[ -n $serial ]]; then
+      via=usb
+    elif serial=$(direct_serial); then
+      via=direct
+    elif [[ -n $nearby ]]; then
+      serial=$(head -1 <<<"$nearby")
+      via=wifi
+    elif serial=$(tailnet_devices | head -1) && [[ -n $serial ]]; then
+      via=tailscale
+      # While traffic flows, an empty CurAddr means Tailscale is relaying.
+      tailnet_peer "${serial%:*}" | jq -e '.Active and .CurAddr == ""' &>/dev/null && relayed=true
     fi
+    [[ $via == none || ${1:-} == --brief ]] || name=$(device_label "$serial")
   fi
 
   classes=$(hyprctl clients -j 2>/dev/null | jq -r '.[].class' | grep '^phonelink' || true)
@@ -936,8 +1134,8 @@ status_json() {
   )
 
   jq -n --arg via "$via" --arg name "$name" --argjson direct "$direct" --argjson supported "$supported" \
-    --argjson mirror "$mirror" --argjson apps "${apps:-[]}" \
-    '{ connected: ($via != "none"), via: $via, name: $name, direct: $direct,
+    --argjson mirror "$mirror" --argjson relayed "$relayed" --argjson apps "${apps:-[]}" \
+    '{ connected: ($via != "none"), via: $via, relayed: $relayed, name: $name, direct: $direct,
        directSupported: $supported, mirrorOpen: $mirror, apps: $apps }'
 }
 
@@ -954,7 +1152,7 @@ open) require_tools; open_app "${1:?Usage: phonelink open <package>}" ;;
 mirror) require_tools; mirror ;;
 pin) require_tools; pin_menu ;;
 pair) require_tools; pair ;;
-connect) require_tools; connect ;;
+connect) require_tools; connect "${1:-}" ;;
 direct) require_tools; direct "${1:-on}" ;;
 wifi) require_tools; wifi ;;
 stop | disconnect) require_tools; disconnect ;;

@@ -2,7 +2,8 @@
 
 Use your Android phone on [Omarchy](https://omarchy.org). Open phone apps in
 their own windows, or mirror the whole screen, and control them with your mouse
-and keyboard. Works over Wi-Fi or USB. Nothing to install on the phone.
+and keyboard. Works over Wi-Fi, USB, or Tailscale when you're away from home.
+Nothing to install on the phone.
 
 ## Install
 
@@ -44,6 +45,19 @@ Samsung: if debugging is greyed out or the mouse doesn't work, turn off
 
 Phone windows tile like any other window. More controls are in
 **Omarchy menu › Phone**.
+
+## Away from home
+
+If the phone and computer are on the same [Tailscale](https://tailscale.com)
+network, phonelink reaches the phone from anywhere:
+
+1. Connect once at home, so phonelink learns the phone's Tailscale address.
+2. Away, keep the phone on Wi-Fi with Wireless debugging on.
+3. Use it as usual. The bar icon shows "Tailscale".
+
+If Wireless debugging was turned off and on, phonelink asks for the port the
+phone shows under **Wireless debugging › IP address & port**. More in
+[docs/reference.md](docs/reference.md#away-from-home-tailscale).
 
 ## Update or remove
 

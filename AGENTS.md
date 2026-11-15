@@ -64,6 +64,10 @@ should turn off **Settings › Security and privacy › Auto Blocker**.
 Then tell them: **Super + Alt + P** opens a phone app, **Super + Alt + Shift + P**
 mirrors the phone, and the phone icon in the bar has everything else.
 
+If the user wants to use the phone away from home, check that `tailscale status`
+lists the phone. Remote use then works by itself once the phone has connected
+nearby. See [docs/reference.md](docs/reference.md#away-from-home-tailscale).
+
 ## Update
 
 ```bash
