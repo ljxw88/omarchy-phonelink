@@ -4,6 +4,11 @@
 -- Updates replace this file unless you've edited it, in which case the new
 -- version is saved beside it as phonelink.lua.new.
 
+-- The bindings and rules below use Omarchy's helpers.
+if not o then
+  return
+end
+
 -- Super + Alt + V switches the focused phone window's sound between this
 -- computer and the phone.
 -- To keep these keys for something else, set `phonelink_bindings = false` in
