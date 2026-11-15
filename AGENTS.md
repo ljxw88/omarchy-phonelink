@@ -1,7 +1,14 @@
 # Instructions for AI agents
 
-How to install, update and remove omarchy-phonelink for a user. Follow the
-steps in order and report what happened in plain words.
+These steps are only for when the user asks you to install, update or remove
+omarchy-phonelink. If you're working on phonelink's code, don't run them: don't
+pull, install packages, run `install.sh` or `uninstall.sh`, or reload Hyprland.
+Whatever the task, never run `phonelink stop` or `phonelink direct off` while
+the user has phone windows open, unless they ask: both close the connection
+those windows use.
+
+When the user does ask, follow the steps in order and report what happened in
+plain words.
 
 ## Install
 
@@ -44,9 +51,10 @@ steps in order and report what happened in plain words.
    phonelink --help              # should list the commands
    ```
 
-6. Pass on any line the installer printed with `!`. These say that
-   Super + Alt + P was already taken, or that the user's edited
-   `~/.config/hypr/phonelink.lua` was kept.
+6. Pass on any line the installer printed with `!`. These say, for example,
+   that phonelink's keys were already taken, that the user's edited
+   `~/.config/hypr/phonelink.lua` was kept, or that the Phone menu or bar icon
+   couldn't be added.
 
 ## Help the user set up their phone
 
@@ -54,8 +62,10 @@ These steps happen on the phone, so guide the user one step at a time:
 
 1. **Settings › About phone › Software information**: tap **Build number** 7 times.
 2. **Settings › Developer options**: turn on **Wireless debugging**.
-3. Run `phonelink pair`. It opens a terminal with a QR code. On the phone, open
-   **Wireless debugging › Pair device with QR code** and scan it.
+3. Ask the user to open **Omarchy menu › Phone › Connection › Pair**, which
+   shows a QR code in a new terminal. On the phone: **Wireless debugging › Pair
+   device with QR code**, and scan it. Don't run `phonelink pair` yourself: in
+   a terminal it shows the code there and waits for keys.
 4. Confirm with `phonelink status`. It should list the phone.
 
 On Samsung phones, if debugging is greyed out or mouse input is blocked, the user
@@ -77,8 +87,6 @@ git -C ~/.local/share/omarchy-phonelink pull && ~/.local/share/omarchy-phonelink
 
 ## Uninstall
 
-Only when the user asks:
-
 ```bash
 ~/.local/share/omarchy-phonelink/uninstall.sh
 ```
@@ -88,8 +96,8 @@ This keeps scrcpy, adb and the user's settings in `~/.config/phonelink`.
 ## Rules
 
 - Don't edit anything in `/usr/share/omarchy`.
-- Don't run `phonelink stop` or `phonelink direct off` while the user has phone
-  windows open, unless they ask. Both close the connection those windows use.
+- `phonelink status` and `phonelink doctor` start adb, which reconnects a
+  phone the user had disconnected.
 - To see which path the phone uses and where each address came from, run
   `phonelink network`.
 - For lag or dropouts, run `phonelink doctor` first, then read
