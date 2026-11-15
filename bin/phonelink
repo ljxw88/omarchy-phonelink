@@ -1,0 +1,787 @@
+#!/bin/bash
+
+# phonelink: use your Android phone from Omarchy, on top of scrcpy.
+#
+#   phonelink              Open the Phone menu
+#   phonelink apps         Pick a phone app and open it in its own window
+#   phonelink open <pkg>   Open one phone app in its own window
+#   phonelink mirror       Mirror and control the whole phone screen
+#   phonelink pin          Choose which phone apps appear in the app launcher
+#   phonelink pair         Pair over Wi-Fi with a QR code (Android 11+)
+#   phonelink direct       Link straight to the phone with Wi-Fi Direct (faster)
+#   phonelink direct off   Drop the direct link
+#   phonelink wifi         Switch a USB-connected phone to Wi-Fi
+#   phonelink stop         Close phone windows and drop all connections
+#   phonelink refresh      Re-read the app list from the phone
+#   phonelink status       Show connected phones
+#
+# Each phone app runs on its own virtual display that resizes with its window,
+# so it tiles like a desktop app and leaves the phone's own screen alone.
+#
+# Over Wi-Fi, video normally travels phone → router → laptop. When the phone is
+# only on Wi-Fi, phonelink sets up a Wi-Fi Direct link (the kind Smart View
+# uses) straight between the two, while both stay on the home network.
+#
+# https://github.com/ljxw88/omarchy-phonelink
+
+set -uo pipefail
+
+SELF=$(readlink -f "$0")
+CONFIG_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/phonelink/config"
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/phonelink"
+LOG_DIR="$STATE_DIR/logs"
+APPS_CACHE="$STATE_DIR/apps.tsv"
+RECENT_FILE="$STATE_DIR/recent"
+TCP_FILE="$STATE_DIR/last-tcp"
+DIRECT_FILE="$STATE_DIR/direct-addr"
+DIRECT_PEER_FILE="$STATE_DIR/direct-peer"
+DIRECT_FAIL_FILE="$STATE_DIR/direct-failed"
+DIRECT_CON="phonelink-direct"
+DESKTOP_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/applications"
+ICON_ROOT="${XDG_DATA_HOME:-$HOME/.local/share}/icons/hicolor"
+ICON_DIR="$ICON_ROOT/256x256/apps"
+
+# Defaults. Override any of them in ~/.config/phonelink/config.
+SERIAL=""                          # pin one phone when several are connected
+DIRECT="auto"                      # auto = use a Wi-Fi Direct link when on Wi-Fi, off = always via the router
+KEYBOARD="uhid"                    # uhid = real keyboard on the phone, sdk = injected text
+APP_DPI=200                        # app window density; higher makes the app UI bigger
+APP_ARGS=(--no-vd-system-decorations --keep-active)
+MIRROR_ARGS=(--max-size=1600)
+COMMON_ARGS=(--video-bit-rate=10M)
+
+[[ -f $CONFIG_FILE ]] && source "$CONFIG_FILE"
+
+mkdir -p "$STATE_DIR" "$LOG_DIR"
+
+# ---------------------------------------------------------------- helpers
+
+notify() {
+  omarchy-notification-send --app-name phonelink -g 󰄜 "$@" &>/dev/null ||
+    notify-send -a phonelink "$@" &>/dev/null || true
+}
+
+die() {
+  echo "phonelink: $*" >&2
+  notify -u normal "Phone" "$*"
+  exit 1
+}
+
+valid_pkg() {
+  [[ $1 =~ ^[A-Za-z0-9_]+(\.[A-Za-z0-9_]+)+$ ]]
+}
+
+require_tools() {
+  command -v scrcpy &>/dev/null && command -v adb &>/dev/null ||
+    die "scrcpy is missing. Install it with: omarchy pkg add scrcpy android-tools"
+}
+
+app_name() {
+  local name
+  name=$(awk -F'\t' -v p="$1" '$2 == p { print $1; exit }' "$APPS_CACHE" 2>/dev/null)
+  printf '%s' "${name:-$1}"
+}
+
+focus_class() {
+  local address
+  address=$(hyprctl clients -j 2>/dev/null | jq -r --arg c "$1" 'first(.[] | select(.class == $c) | .address) // empty')
+  [[ -n $address ]] || return 1
+  hyprctl dispatch "hl.dsp.focus({ window = \"address:$address\" })" &>/dev/null ||
+    hyprctl dispatch focuswindow "address:$address" &>/dev/null
+}
+
+# Only one scrcpy window should forward the phone's sound, or it plays twice.
+audio_busy() {
+  local pid
+  for pid in $(pgrep -x scrcpy); do
+    tr '\0' '\n' <"/proc/$pid/cmdline" 2>/dev/null | grep -qx -- '--no-audio' || return 0
+  done
+  return 1
+}
+
+# The current Omarchy theme's background, so bars around the phone picture
+# blend in like a terminal's.
+theme_background() {
+  local colors="$HOME/.local/state/omarchy/current/theme/colors.toml" color
+  color=$(sed -nE 's/^background *= *"#?([0-9A-Fa-f]{6})".*/\1/p' "$colors" 2>/dev/null | head -1)
+  printf '%s' "${color:-1a1b26}"
+}
+
+# Options shared by every phone window. Super carries scrcpy's own shortcuts,
+# as it does Omarchy's, so Alt reaches the phone's apps.
+window_args() {
+  printf '%s\n' --background-color="$(theme_background)" --shortcut-mod=lsuper --keyboard="$KEYBOARD"
+}
+
+# Logical size of the tile a new window gets in Hyprland's dwindle layout: the
+# whole workspace when it's empty, otherwise half of the focused window.
+# Starting the phone app at that size spares it a relayout once it's tiled.
+tile_size() {
+  local w h
+  read -r w h < <(hyprctl activewindow -j 2>/dev/null |
+    jq -r 'select(.size and .floating == false and .fullscreen == 0) | "\(.size[0]) \(.size[1])"' 2>/dev/null)
+  if [[ -n ${w:-} ]]; then
+    if ((w > h)); then w=$((w / 2)); else h=$((h / 2)); fi
+  else
+    read -r w h < <(hyprctl monitors -j 2>/dev/null |
+      jq -r '.[] | select(.focused) | "\((.width / .scale) | floor) \((.height / .scale) | floor)"')
+  fi
+  [[ -n ${w:-} && -n ${h:-} ]] || return 1
+  printf '%dx%d' $((w / 2 * 2)) $((h / 2 * 2))
+}
+
+# ---------------------------------------------------------------- devices
+
+ready_devices() {
+  adb devices 2>/dev/null | awk 'NR > 1 && $2 == "device" { print $1 }'
+}
+
+connect_wireless() {
+  local addr
+  # Phones with Wireless debugging on announce themselves over mDNS.
+  while read -r addr; do
+    [[ -n $addr ]] && timeout 4 adb connect "$addr" &>/dev/null
+  done < <(adb mdns services 2>/dev/null | awk '/_adb-tls-connect/ { print $NF }')
+
+  # Phones switched to Wi-Fi with `phonelink wifi`.
+  [[ -s $TCP_FILE ]] && timeout 4 adb connect "$(<"$TCP_FILE")" &>/dev/null
+  sleep 0.5
+}
+
+# Prints the serial of the phone to use: USB first, then the direct Wi-Fi
+# link, then the router. With "direct", sets up the direct link if it's down.
+pick_device() {
+  local want_direct=${1:-} devices serial direct
+  adb start-server &>/dev/null
+
+  if [[ -n $SERIAL ]]; then
+    ready_devices | grep -qxF "$SERIAL" || connect_wireless
+    ready_devices | grep -qxF "$SERIAL" || die "Phone $SERIAL isn't connected."
+    printf '%s' "$SERIAL"
+    return
+  fi
+
+  devices=$(ready_devices)
+  if [[ -z $devices ]]; then
+    connect_wireless
+    devices=$(ready_devices)
+  fi
+
+  if [[ -z $devices ]]; then
+    if adb devices 2>/dev/null | grep -q $'\tunauthorized'; then
+      die "Unlock your phone and tap Allow on the USB debugging prompt."
+    fi
+    die "No phone found. Plug it in with USB debugging on, or pair it over Wi-Fi from the Phone menu."
+  fi
+
+  serial=$(grep -vE ':|_adb-tls-connect' <<<"$devices" | head -1)
+  if [[ -n $serial ]]; then
+    printf '%s' "$serial"
+    return
+  fi
+
+  if direct=$(direct_serial); then
+    printf '%s' "$direct"
+    return
+  fi
+
+  serial=$(grep -vxF "$(cat "$DIRECT_FILE" 2>/dev/null)" <<<"$devices" | head -1)
+  if [[ $want_direct == direct && $DIRECT == auto && -n $(p2p_device) ]] && direct_allowed; then
+    if direct=$(direct_connect "$serial"); then
+      printf '%s' "$direct"
+      return
+    fi
+    date +%s >"$DIRECT_FAIL_FILE"
+    notify "Phone" "Couldn't set up the direct link, so this goes through your Wi-Fi router."
+  fi
+  printf '%s' "$serial"
+}
+
+# ---------------------------------------------------------------- direct Wi-Fi link
+
+p2p_device() {
+  nmcli -t -f DEVICE,TYPE device 2>/dev/null | awk -F: '$2 == "wifi-p2p" { print $1; exit }'
+}
+
+direct_link_up() {
+  nmcli -t -f NAME connection show --active 2>/dev/null | grep -qxF "$DIRECT_CON"
+}
+
+# After a failed attempt, wait a while before trying again on every launch.
+direct_allowed() {
+  [[ ! -s $DIRECT_FAIL_FILE ]] || (($(date +%s) - $(<"$DIRECT_FAIL_FILE") > 600))
+}
+
+# Prints the serial of the phone over the direct link, if the link is up.
+direct_serial() {
+  local addr
+  [[ -s $DIRECT_FILE ]] && direct_link_up || return 1
+  addr=$(<"$DIRECT_FILE")
+  ready_devices | grep -qxF "$addr" || timeout 4 adb connect "$addr" &>/dev/null
+  ready_devices | grep -qxF "$addr" || return 1
+  printf '%s' "$addr"
+}
+
+# Wireless debugging listens on every network the phone is on, so the port
+# from the router connection also works over the direct link.
+adb_port() {
+  if [[ $1 =~ :([0-9]+)$ ]]; then
+    printf '%s' "${BASH_REMATCH[1]}"
+  else
+    adb mdns services 2>/dev/null |
+      awk -v n="${1%%.*}" '$1 == n && /_adb-tls-connect/ { sub(/.*:/, "", $NF); print $NF; exit }'
+  fi
+}
+
+nm_property() {
+  busctl --json=short get-property org.freedesktop.NetworkManager "$1" "$2" "$3" 2>/dev/null | jq -r '.data | if type == "array" then .[] else . end'
+}
+
+# Prints "mac<TAB>name" for each Wi-Fi Direct device in range.
+p2p_peers() {
+  local peer
+  for peer in $(nm_property "$1" org.freedesktop.NetworkManager.Device.WifiP2P Peers); do
+    printf '%s\t%s\n' \
+      "$(nm_property "$peer" org.freedesktop.NetworkManager.WifiP2PPeer HwAddress)" \
+      "$(nm_property "$peer" org.freedesktop.NetworkManager.WifiP2PPeer Name)"
+  done
+}
+
+# Taps Connect on the phone's Wi-Fi Direct invitation, so the user needn't.
+accept_invitation() {
+  local xml node x1 y1 x2 y2
+  xml=$(adb -s "$1" exec-out uiautomator dump /dev/tty 2>/dev/null)
+  node=$(grep -oE '<node [^>]*resource-id="android:id/button1"[^>]*package="[^"]*wifi[^"]*"[^>]*>' <<<"$xml" | head -1)
+  [[ -n $node ]] || return 1
+  read -r x1 y1 x2 y2 < <(grep -oE 'bounds="[^"]*"' <<<"$node" | grep -oE '[0-9]+' | tr '\n' ' ')
+  adb -s "$1" shell input tap $(((x1 + x2) / 2)) $(((y1 + y2) / 2)) &>/dev/null
+}
+
+phone_locked() {
+  adb -s "$1" shell dumpsys window 2>/dev/null | grep -q "isKeyguardShowing=true"
+}
+
+# Links the laptop and the phone (reached as $1 over the router) with
+# Wi-Fi Direct, and prints the phone's adb serial over that link.
+direct_connect() {
+  local serial=$1 dev path port name known peer pid ok iface ip phone _
+  dev=$(p2p_device)
+  [[ -n $dev ]] || return 1
+  path=$(nmcli -g GENERAL.DBUS-PATH device show "$dev" 2>/dev/null)
+  port=$(adb_port "$serial")
+  [[ -n $path && -n $port ]] || return 1
+
+  adb -s "$serial" shell input keyevent KEYCODE_WAKEUP &>/dev/null
+  if phone_locked "$serial"; then
+    notify -u normal "Phone" "Unlock your phone to set up the fast direct link."
+    for _ in {1..30}; do
+      sleep 1
+      phone_locked "$serial" || break
+    done
+    phone_locked "$serial" && return 1
+  fi
+
+  notify "Phone" "Setting up a direct Wi-Fi link to your phone…"
+  name=$(adb -s "$serial" shell settings get global device_name 2>/dev/null | tr -d '\r')
+  known=$(cat "$DIRECT_PEER_FILE" 2>/dev/null)
+
+  # Android only answers Wi-Fi Direct while its settings page is searching,
+  # and only starts searching when the page opens fresh.
+  adb -s "$serial" shell am force-stop com.android.settings &>/dev/null
+  adb -s "$serial" shell am start -n 'com.android.settings/.Settings\$WifiP2pSettingsActivity' &>/dev/null
+  busctl call org.freedesktop.NetworkManager "$path" org.freedesktop.NetworkManager.Device.WifiP2P \
+    StartFind 'a{sv}' 1 timeout i 40 &>/dev/null
+
+  for _ in {1..40}; do
+    peer=$(p2p_peers "$path" | awk -F'\t' -v n="$name" -v m="${known,,}" '$2 == n || tolower($1) == m { print $1; exit }')
+    [[ -n $peer ]] && break
+    sleep 1
+  done
+  if [[ -z $peer ]]; then
+    adb -s "$serial" shell input keyevent KEYCODE_BACK &>/dev/null
+    return 1
+  fi
+  echo "$peer" >"$DIRECT_PEER_FILE"
+
+  if nmcli -t -f NAME connection show 2>/dev/null | grep -qxF "$DIRECT_CON"; then
+    nmcli connection modify "$DIRECT_CON" wifi-p2p.peer "$peer" &>/dev/null
+  else
+    nmcli connection add type wifi-p2p con-name "$DIRECT_CON" ifname "$dev" wifi-p2p.peer "$peer" \
+      ipv6.method disabled connection.autoconnect no &>/dev/null || return 1
+  fi
+
+  nmcli --wait 45 connection up "$DIRECT_CON" &>/dev/null &
+  pid=$!
+  while kill -0 "$pid" 2>/dev/null; do
+    accept_invitation "$serial" && break
+    sleep 1
+  done
+  wait "$pid"
+  ok=$?
+  adb -s "$serial" shell input keyevent KEYCODE_BACK &>/dev/null
+  ((ok == 0)) || return 1
+
+  # Android runs the link at .1 and hands the laptop an address. If the laptop
+  # ended up running it instead, the phone is the neighbour that asked for one.
+  iface=$(nmcli -g GENERAL.IP-IFACE device show "$dev" 2>/dev/null)
+  for _ in {1..10}; do
+    ip=$(ip -4 -o addr show dev "$iface" 2>/dev/null | awk '{ sub(/\/.*/, "", $4); print $4; exit }')
+    [[ -n $ip ]] && break
+    sleep 1
+  done
+  [[ -n $ip ]] || return 1
+  if [[ ${ip##*.} != 1 ]]; then
+    phone="${ip%.*}.1"
+  else
+    for _ in {1..10}; do
+      phone=$(ip -4 neigh show dev "$iface" 2>/dev/null | awk '$1 != "" { print $1; exit }')
+      [[ -n $phone ]] && break
+      sleep 1
+    done
+  fi
+  [[ -n $phone ]] || return 1
+
+  for _ in {1..5}; do
+    adb connect "$phone:$port" 2>/dev/null | grep -q "connected to" && break
+    sleep 1
+  done
+  ready_devices | grep -qxF "$phone:$port" || return 1
+
+  echo "$phone:$port" >"$DIRECT_FILE"
+  rm -f "$DIRECT_FAIL_FILE"
+  printf '%s' "$phone:$port"
+}
+
+direct_disconnect() {
+  [[ -s $DIRECT_FILE ]] && adb disconnect "$(<"$DIRECT_FILE")" &>/dev/null
+  rm -f "$DIRECT_FILE"
+  nmcli connection down "$DIRECT_CON" &>/dev/null
+}
+
+direct() {
+  local serial direct
+  if [[ $1 == toggle ]]; then
+    direct_link_up && set -- off || set -- on
+  fi
+
+  case $1 in
+  off)
+    direct_disconnect
+    notify "Phone" "Direct link closed."
+    ;;
+  *)
+    if direct=$(direct_serial); then
+      notify "Phone" "Direct link is already up."
+      return
+    fi
+    [[ -n $(p2p_device) ]] || die "This computer can't do Wi-Fi Direct. It needs NetworkManager with wpa_supplicant and a Wi-Fi card that supports it."
+    serial=$(pick_device) || exit 1
+    [[ $serial == *:* || $serial == *_adb-tls-connect* ]] || die "Your phone is on USB, which is already the fastest link."
+    rm -f "$DIRECT_FAIL_FILE"
+    if direct=$(direct_connect "$serial"); then
+      notify "Phone" "Direct link is up. Phone windows now skip your Wi-Fi router."
+    else
+      die "Couldn't set up the direct link. Keep the phone unlocked and close by, then try again."
+    fi
+    ;;
+  esac
+}
+
+device_label() {
+  local name
+  name=$(adb -s "$1" shell settings get global device_name 2>/dev/null | tr -d '\r')
+  [[ -z $name || $name == null ]] && name=$(adb -s "$1" shell getprop ro.product.model 2>/dev/null | tr -d '\r')
+  printf '%s' "${name:-Phone}"
+}
+
+# ---------------------------------------------------------------- app list
+
+# scrcpy prints " * Name<padding> package" (system apps) or " - ..." (others);
+# a name of 30 characters or more is followed by the package on its own line.
+refresh_apps() {
+  local serial=$1 tmp
+  tmp=$(mktemp)
+  scrcpy -s "$serial" --list-apps 2>&1 | awk '
+    /^ [*-] / {
+      line = substr($0, 4)
+      if (match(line, /  +[^ ]+$/)) {
+        name = substr(line, 1, RSTART - 1)
+        pkg = substr(line, RSTART); gsub(/ /, "", pkg)
+        print name "\t" pkg
+        pending = ""
+      } else {
+        pending = line
+      }
+      next
+    }
+    pending != "" && /^ +[^ ]+$/ {
+      pkg = $0; gsub(/ /, "", pkg)
+      print pending "\t" pkg
+      pending = ""
+    }
+  ' | sort -f -t $'\t' -k1,1 -k2,2 >"$tmp"
+
+  if [[ -s $tmp ]]; then
+    mv "$tmp" "$APPS_CACHE"
+  else
+    rm -f "$tmp"
+    die "Couldn't read the app list from the phone."
+  fi
+}
+
+record_recent() {
+  local tmp
+  tmp=$(mktemp)
+  { echo "$1"; grep -vxF "$1" "$RECENT_FILE" 2>/dev/null; } | head -6 >"$tmp"
+  mv "$tmp" "$RECENT_FILE"
+}
+
+# ---------------------------------------------------------------- launcher entries
+
+desktop_escape() {
+  local value=$1
+  value=${value//\\/\\\\}
+  value=${value//$'\t'/ }
+  value=${value//$'\n'/ }
+  value=${value//$'\r'/}
+  printf '%s' "$value"
+}
+
+fetch_icon() {
+  local pkg=$1 dest="$ICON_DIR/phonelink.$1.png" page url
+  [[ -s $dest ]] && return 0
+  mkdir -p "$ICON_DIR"
+
+  page=$(curl -fsSL --max-time 10 -A "Mozilla/5.0" "https://play.google.com/store/apps/details?id=$pkg&hl=en") || return 1
+  url=$(grep -oE '<meta property="og:image" content="[^"]+"' <<<"$page" | head -1 | sed -E 's/.*content="([^"]+)"/\1/')
+  [[ $url == https://* ]] || return 1
+
+  curl -fsSL --max-time 10 -o "$dest.tmp" "${url%=*}=s256-br30" && mv "$dest.tmp" "$dest" || {
+    rm -f "$dest.tmp"
+    return 1
+  }
+  gtk-update-icon-cache "$ICON_ROOT" &>/dev/null || true
+}
+
+# Every opened app gets a (hidden) desktop entry, so the dock can name its
+# window and show its icon. Pinning only makes the entry visible in the launcher.
+write_entry() {
+  local pkg=$1 name=$2 hidden=$3 icon=phone
+  fetch_icon "$pkg" && icon="phonelink.$pkg"
+  mkdir -p "$DESKTOP_DIR"
+  cat >"$DESKTOP_DIR/phonelink.$pkg.desktop" <<EOF
+[Desktop Entry]
+Type=Application
+Name=$(desktop_escape "$name") (Phone)
+Comment=Runs on your phone
+Exec=phonelink open $pkg
+Icon=$icon
+StartupWMClass=phonelink.$pkg
+Categories=Utility;
+Keywords=android;phone;$pkg;
+NoDisplay=$hidden
+EOF
+}
+
+is_pinned() {
+  grep -qx 'NoDisplay=false' "$DESKTOP_DIR/phonelink.$1.desktop" 2>/dev/null
+}
+
+# ---------------------------------------------------------------- launching
+
+# Runs scrcpy detached from whatever launched us, and reports failures.
+# PHONELINK_DRY_RUN=1 prints the scrcpy command instead.
+spawn() {
+  if [[ -n ${PHONELINK_DRY_RUN:-} ]]; then
+    printf 'SDL_APP_ID=%q scrcpy' "$1"
+    printf ' %q' "${@:3}"
+    echo
+  elif command -v uwsm-app &>/dev/null; then
+    setsid -f uwsm-app -- "$SELF" __run "$@" &>/dev/null
+  else
+    setsid -f "$SELF" __run "$@" &>/dev/null
+  fi
+}
+
+run_scrcpy() {
+  local app_id=$1 label=$2 log code error
+  shift 2
+  log="$LOG_DIR/$app_id.log"
+
+  SDL_APP_ID="$app_id" scrcpy "$@" >"$log" 2>&1
+  code=$?
+
+  if grep -q "INJECT_EVENTS" "$log"; then
+    notify -u normal "$label" "The phone blocked mouse and keyboard input. Samsung: turn off Settings › Security and privacy › Auto Blocker. Xiaomi: turn on Developer options › USB debugging (Security settings)."
+  elif ((code >= 128)); then
+    : # closed by phonelink disconnect
+  elif ((code == 2)); then
+    notify "$label" "Phone disconnected."
+  elif ((code != 0)); then
+    error=$(grep -E "ERROR:" "$log" | tail -1 | sed 's/.*ERROR: *//')
+    notify -u normal "$label couldn't start" "${error:-See $log}"
+  fi
+}
+
+open_app() {
+  local pkg=$1 name serial args wargs
+  valid_pkg "$pkg" || die "Not an Android package name: $pkg"
+  name=$(app_name "$pkg")
+
+  record_recent "$pkg"
+  focus_class "phonelink.$pkg" && return
+
+  serial=$(pick_device direct) || exit 1
+  mapfile -t wargs < <(window_args)
+  args=(-s "$serial" --new-display="$(tile_size)/$APP_DPI" --flex-display --start-app="$pkg"
+    --window-title="$name" "${wargs[@]}" "${COMMON_ARGS[@]}" "${APP_ARGS[@]}")
+  audio_busy && args+=(--no-audio)
+
+  spawn "phonelink.$pkg" "$name" "${args[@]}"
+
+  [[ -n ${PHONELINK_DRY_RUN:-} || -f "$DESKTOP_DIR/phonelink.$pkg.desktop" ]] ||
+    (write_entry "$pkg" "$name" true &>/dev/null &)
+}
+
+mirror() {
+  local serial label args wargs
+  focus_class "phonelink" && return
+
+  serial=$(pick_device direct) || exit 1
+  label=$(device_label "$serial")
+  mapfile -t wargs < <(window_args)
+  args=(-s "$serial" --window-title="$label" "${wargs[@]}" "${COMMON_ARGS[@]}" "${MIRROR_ARGS[@]}")
+  audio_busy && args+=(--no-audio)
+
+  spawn "phonelink" "$label" "${args[@]}"
+}
+
+choose_app() {
+  local rows=() pkg name selection serial
+
+  if [[ ! -s $APPS_CACHE ]]; then
+    serial=$(pick_device) || exit 1
+    notify "Phone" "Reading apps from your phone…"
+    refresh_apps "$serial"
+  fi
+
+  rows+=($'󰍹\tMirror whole screen')
+  while read -r pkg; do
+    name=$(awk -F'\t' -v p="$pkg" '$2 == p { print $1; exit }' "$APPS_CACHE")
+    [[ -n $name ]] && rows+=($'󰋚\t'"$name"$'\t'"$pkg")
+  done < <(cat "$RECENT_FILE" 2>/dev/null)
+  while IFS=$'\t' read -r name pkg; do
+    rows+=($'󰀲\t'"$name"$'\t'"$pkg")
+  done <"$APPS_CACHE"
+  rows+=($'󰑐\tRefresh app list')
+
+  selection=$(omarchy-menu-select "Phone apps" "${rows[@]}" -- --width 560) || exit 0
+
+  case $selection in
+  "Mirror whole screen") mirror ;;
+  "Refresh app list")
+    serial=$(pick_device) || exit 1
+    notify "Phone" "Reading apps from your phone…"
+    refresh_apps "$serial"
+    choose_app
+    ;;
+  *$'\t'*) open_app "${selection##*$'\t'}" ;;
+  esac
+}
+
+pin_menu() {
+  local rows=() selected=() name pkg chosen serial
+
+  if [[ ! -s $APPS_CACHE ]]; then
+    serial=$(pick_device) || exit 1
+    notify "Phone" "Reading apps from your phone…"
+    refresh_apps "$serial"
+  fi
+
+  while IFS=$'\t' read -r name pkg; do
+    rows+=($'󰀲\t'"$name"$'\t'"$pkg")
+    is_pinned "$pkg" && selected+=(--selected "$name"$'\t'"$pkg")
+  done <"$APPS_CACHE"
+
+  chosen=$(omarchy-menu-select "Show in app launcher" "${rows[@]}" -- --multiple --width 560 "${selected[@]}") || exit 0
+  chosen=$(jq -r '.[]' <<<"$chosen" 2>/dev/null | awk -F'\t' '{ print $NF }')
+
+  while IFS=$'\t' read -r name pkg; do
+    if grep -qxF "$pkg" <<<"$chosen"; then
+      is_pinned "$pkg" || write_entry "$pkg" "$name" false
+    elif is_pinned "$pkg"; then
+      sed -i 's/^NoDisplay=false$/NoDisplay=true/' "$DESKTOP_DIR/phonelink.$pkg.desktop"
+    fi
+  done <"$APPS_CACHE"
+
+  update-desktop-database "$DESKTOP_DIR" &>/dev/null || true
+  notify "Phone" "Pinned phone apps are in the app launcher."
+}
+
+# ---------------------------------------------------------------- Wi-Fi
+
+wait_for_wireless() {
+  local ip=$1 addr _
+  for _ in {1..15}; do
+    if adb devices 2>/dev/null | awk '$2 == "device"' | grep -qE "_adb-tls-connect|^$ip:"; then
+      return 0
+    fi
+    addr=$(adb mdns services 2>/dev/null | awk -v ip="$ip:" '/_adb-tls-connect/ && index($NF, ip) == 1 { print $NF; exit }')
+    [[ -n $addr ]] && adb connect "$addr" &>/dev/null
+    sleep 1
+  done
+  return 1
+}
+
+finish_pairing() {
+  local ip=$1 addr
+  echo
+  if ! wait_for_wireless "$ip"; then
+    echo "Paired, but the phone didn't connect by itself."
+    read -rp "IP address & port shown at the top of Wireless debugging: " addr
+    adb connect "$addr" | grep -q "connected to" || {
+      echo "Couldn't connect to $addr."
+      return 1
+    }
+  fi
+  echo -e "\e[32m✓ Connected.\e[0m The phone reconnects by itself whenever Wireless debugging is on."
+  echo "Open phone apps with Super + Alt + P."
+}
+
+pair_manual() {
+  local addr code
+  echo
+  echo "On the phone, tap 'Pair device with pairing code'."
+  read -rp "IP address & port shown there: " addr
+  read -rp "Wi-Fi pairing code: " code
+  adb_pair "$addr" "$code" || return 1
+  finish_pairing "${addr%:*}"
+}
+
+adb_pair() {
+  local output
+  output=$(adb pair "$1" "$2" 2>&1)
+  echo "$output"
+  grep -q "Successfully paired" <<<"$output"
+}
+
+pair() {
+  # Started from a menu or keybinding: open a terminal to show the QR code in.
+  if [[ ! -t 0 ]]; then
+    exec setsid uwsm-app -- xdg-terminal-exec --app-id=org.omarchy.terminal --title="Pair phone" \
+      -e bash -c '"$0" pair; code=$?; ((code == 130)) || omarchy-show-done $code' "$SELF"
+  fi
+  command -v qrencode &>/dev/null || die "qrencode is missing. Install it with: omarchy pkg add qrencode"
+
+  local name pass addr key deadline
+  name="phonelink-$RANDOM$RANDOM"
+  pass=$(LC_ALL=C tr -dc 'A-Za-z0-9' </dev/urandom | head -c 12)
+  adb start-server &>/dev/null
+
+  clear
+  echo "Pair your phone over Wi-Fi (same network as this computer)"
+  echo
+  echo "On the phone: Settings › Developer options › Wireless debugging (on)"
+  echo "              › Pair device with QR code, and scan this:"
+  qrencode -t ansiutf8 -m 2 "WIFI:T:ADB;S:$name;P:$pass;;"
+  echo "Waiting for the phone… (c: use a pairing code instead, q: quit)"
+
+  deadline=$((SECONDS + 300))
+  while ((SECONDS < deadline)); do
+    addr=$(adb mdns services 2>/dev/null | awk -v n="$name" '$1 == n && /_adb-tls-pairing/ { print $NF; exit }')
+    if [[ -n $addr ]]; then
+      echo "Found the phone at $addr, pairing…"
+      adb_pair "$addr" "$pass" || return 1
+      finish_pairing "${addr%:*}"
+      return
+    fi
+    if read -rsn1 -t 1 key; then
+      case $key in
+      c | C) pair_manual; return ;;
+      q | Q) return 130 ;;
+      esac
+    fi
+  done
+  echo "Timed out."
+  return 1
+}
+
+wifi() {
+  local serial ip
+  adb start-server &>/dev/null
+  serial=$(ready_devices | grep -vE ':|_adb-tls-connect' | head -1)
+  [[ -n $serial ]] || die "Plug your phone in with USB first."
+
+  ip=$(adb -s "$serial" shell ip -f inet addr show wlan0 2>/dev/null | awk '/inet / { sub(/\/.*/, "", $2); print $2; exit }')
+  [[ -n $ip ]] || die "Your phone isn't on Wi-Fi."
+
+  adb -s "$serial" tcpip 5555 &>/dev/null || die "Couldn't switch the phone to Wi-Fi."
+  sleep 2
+  if adb connect "$ip:5555" | grep -q "connected to"; then
+    echo "$ip:5555" >"$TCP_FILE"
+    notify "Phone on Wi-Fi" "You can unplug the cable. This lasts until the phone restarts."
+  else
+    die "Couldn't reach the phone at $ip."
+  fi
+}
+
+disconnect() {
+  local pid
+  # Close the phone windows phonelink opened, then drop every link. Stopping
+  # the adb server keeps it from reconnecting to the phone over mDNS; the next
+  # phonelink command starts it again.
+  for pid in $(pgrep -x scrcpy); do
+    tr '\0' '\n' <"/proc/$pid/environ" 2>/dev/null | grep -q '^SDL_APP_ID=phonelink' && kill "$pid"
+  done
+  direct_disconnect
+  adb disconnect &>/dev/null
+  adb kill-server &>/dev/null
+  rm -f "$TCP_FILE"
+  notify "Phone" "Disconnected. Open a phone app or the mirror to connect again."
+}
+
+status() {
+  adb start-server &>/dev/null
+  echo "Connected phones:"
+  adb devices -l | tail -n +2 | grep . || echo "  none"
+  if direct_serial >/dev/null; then
+    echo "Direct link: up ($(<"$DIRECT_FILE"))"
+  else
+    echo "Direct link: down"
+  fi
+  [[ -s $APPS_CACHE ]] && echo "Cached apps: $(wc -l <"$APPS_CACHE")"
+}
+
+usage() {
+  sed -n '3p' "$SELF" | sed 's/^# //'
+  echo
+  grep -E '^#   phonelink' "$SELF" | sed 's/^# //'
+}
+
+# ---------------------------------------------------------------- main
+
+cmd=${1:-menu}
+shift || true
+
+case $cmd in
+__run) run_scrcpy "$@" ;;
+menu) omarchy-menu summon phone ;;
+apps) require_tools; choose_app ;;
+open) require_tools; open_app "${1:?Usage: phonelink open <package>}" ;;
+mirror) require_tools; mirror ;;
+pin) require_tools; pin_menu ;;
+pair) require_tools; pair ;;
+direct) require_tools; direct "${1:-on}" ;;
+wifi) require_tools; wifi ;;
+stop | disconnect) require_tools; disconnect ;;
+refresh)
+  require_tools
+  serial=$(pick_device) || exit 1
+  refresh_apps "$serial"
+  echo "Apps: $(wc -l <"$APPS_CACHE")"
+  notify "Phone" "Found $(wc -l <"$APPS_CACHE") apps on your phone."
+  ;;
+status) require_tools; status ;;
+-h | --help | help) usage ;;
+*) usage; exit 1 ;;
+esac

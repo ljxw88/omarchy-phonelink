@@ -1,0 +1,23 @@
+# phonelink settings (bash). Uncomment to change a default.
+
+# Use one specific phone when several are connected (see `phonelink status`).
+# SERIAL="R5CT1234567"
+
+# Over Wi-Fi, link straight to the phone with Wi-Fi Direct (auto), or always go
+# through the router (off). The phone must be unlocked the first time each session.
+# DIRECT="auto"
+
+# uhid: the phone sees a real keyboard (shortcuts, layouts, and the phone's own
+# keyboard app for languages like Chinese). sdk: types text, ASCII only.
+# KEYBOARD="uhid"
+
+# Density of single-app windows. Higher = bigger text and buttons.
+# APP_DPI=200
+
+# Extra scrcpy options (see `scrcpy --help`).
+# COMMON_ARGS=(--video-bit-rate=10M)
+# Show the phone keyboard and IME candidates inside app windows instead of on the phone:
+# APP_ARGS=(--no-vd-system-decorations --keep-active --display-ime-policy=local)
+# Mirror resolution cap (the Fold's inner screen is 2448 wide). Lower = snappier.
+# Add --turn-screen-off to keep the phone's own screen dark while mirroring:
+# MIRROR_ARGS=(--max-size=1600)

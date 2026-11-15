@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Phone
+Comment=Use your Android phone: apps in windows, screen mirroring
+Exec=phonelink
+Icon=phone
+StartupWMClass=phonelink
+Categories=Utility;
+Keywords=android;phone;samsung;scrcpy;mirror;
