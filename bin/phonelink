@@ -16,6 +16,7 @@
 #   phonelink stop         Close phone windows and drop all connections
 #   phonelink refresh      Re-read the app list from the phone
 #   phonelink status       Show connected phones
+#   phonelink doctor       Check for common causes of lag and dropouts
 #
 # Each phone app runs on its own virtual display that resizes with its window,
 # so it tiles like a desktop app and leaves the phone's own screen alone.
@@ -26,6 +27,10 @@
 #
 # Away from home, phonelink reaches the phone over Tailscale when both are on
 # the same tailnet.
+#
+# Each window runs as a session that watches its connection: it lowers the
+# video quality when the link falls behind, and reconnects when the link
+# drops, freezes, or a better one turns up.
 #
 # https://github.com/ljxw88/omarchy-phonelink
 
@@ -43,6 +48,7 @@ DIRECT_PEER_FILE="$STATE_DIR/direct-peer"
 DIRECT_FAIL_FILE="$STATE_DIR/direct-failed"
 DIRECT_CON="phonelink-direct"
 TAILNET_FILE="$STATE_DIR/tailnet"
+QUALITY_FILE="$STATE_DIR/quality"
 DESKTOP_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/applications"
 ICON_ROOT="${XDG_DATA_HOME:-$HOME/.local/share}/icons/hicolor"
 ICON_DIR="$ICON_ROOT/256x256/apps"
@@ -55,10 +61,12 @@ KEYBOARD="uhid"                    # uhid = real keyboard on the phone, sdk = in
 APP_DPI=200                        # app window density; higher makes the app UI bigger
 APP_ARGS=(--no-vd-system-decorations --keep-active)
 MIRROR_ARGS=(--max-size=1600)
-COMMON_ARGS=(--video-bit-rate=10M)
+COMMON_ARGS=()                     # extra scrcpy options for every window; they override the automatic quality
 TAILSCALE="auto"                   # auto = reach the phone over Tailscale when it isn't nearby, off = never
 TAILSCALE_HOST=""                  # the phone's Tailscale name or address, if phonelink can't work it out
-REMOTE_ARGS=(--video-bit-rate=4M --max-fps=30)  # extra scrcpy options over Tailscale
+REMOTE_ARGS=()                     # extra scrcpy options over Tailscale
+ADAPT="auto"                       # auto = fit the video quality to the connection, off = scrcpy's defaults plus your options
+RECONNECT_SECS=120                 # how long a dropped window keeps trying to come back; 0 = close it instead
 
 # shellcheck source=/dev/null
 [[ -f $CONFIG_FILE ]] && source "$CONFIG_FILE"
@@ -74,7 +82,7 @@ notify() {
 
 die() {
   echo "phonelink: $*" >&2
-  notify -u normal "Phone" "$*"
+  [[ -n ${PHONELINK_QUIET:-} ]] || notify -u normal "Phone" "$*"
   exit 1
 }
 
@@ -195,11 +203,48 @@ tailnet_devices() {
   return 0
 }
 
+# Whether the phone answers on this connection. A connection from before a
+# network change can still be listed as connected while leading nowhere.
+phone_alive() {
+  timeout 4 adb -s "$1" shell true &>/dev/null
+}
+
+# Whether a running scrcpy uses this connection.
+serial_in_use() {
+  local pid
+  for pid in $(pgrep -x scrcpy); do
+    tr '\0' '\n' <"/proc/$pid/cmdline" 2>/dev/null | grep -qxF -- "$1" && return 0
+  done
+  return 1
+}
+
+# How a serial reaches the phone: usb, direct, wifi or tailscale.
+path_of() {
+  if is_tailnet_serial "$1"; then
+    echo tailscale
+  elif [[ -s $DIRECT_FILE && $1 == "$(<"$DIRECT_FILE")" ]]; then
+    echo direct
+  elif [[ $1 == *:* || $1 == *_adb-tls-connect* ]]; then
+    echo wifi
+  else
+    echo usb
+  fi
+}
+
+path_label() {
+  case $1 in
+  usb) echo "USB" ;;
+  direct) echo "the direct Wi-Fi link" ;;
+  wifi) echo "Wi-Fi" ;;
+  tailscale) echo "Tailscale" ;;
+  esac
+}
+
 # Prints the serial of the phone to use: USB first, then the direct Wi-Fi
-# link, then the router, then Tailscale. With "direct", sets up the direct
-# link if it's down.
+# link, then the router, then Tailscale, skipping any that don't answer.
+# With "direct", sets up the direct link if it's down.
 pick_device() {
-  local want_direct=${1:-} nearby serial direct
+  local want_direct=${1:-} serial="" candidates=() c direct="" demoted=""
   adb start-server &>/dev/null
 
   if [[ -n $SERIAL ]]; then
@@ -212,51 +257,65 @@ pick_device() {
     return
   fi
 
-  nearby=$(nearby_devices)
-  if [[ -z $nearby ]]; then
-    connect_wireless
-    nearby=$(nearby_devices)
-  fi
+  [[ -n $(nearby_devices) ]] || connect_wireless
 
-  if [[ -z $nearby ]]; then
-    serial=$(tailnet_devices | head -1)
-    if [[ -z $serial ]] && connect_tailscale; then
-      serial=$REMOTE_SERIAL
-    fi
-    if [[ -n $serial ]]; then
-      printf '%s' "$serial"
-      return
-    fi
-    if adb devices 2>/dev/null | grep -q $'\tunauthorized'; then
-      die "Unlock your phone and tap Allow on the USB debugging prompt."
-    fi
-    die "${REMOTE_ERROR:-No phone found. Turn on Wireless debugging, plug the phone in, or pair it from the Phone menu.}"
-  fi
-
-  serial=$(usb_devices <<<"$nearby" | head -1)
+  serial=$(nearby_devices | usb_devices | head -1)
   if [[ -n $serial ]]; then
     learn_tailnet "$serial" &>/dev/null &
     printf '%s' "$serial"
     return
   fi
 
+  # A direct link on another channel than the Wi-Fi connection makes the
+  # Wi-Fi card switch back and forth, so the router goes first then.
   if direct=$(direct_serial); then
-    printf '%s' "$direct"
-    return
+    if direct_mcc; then demoted=$direct; else candidates+=("$direct"); fi
   fi
+  while read -r c; do
+    [[ -n $c && $c != "$direct" ]] && candidates+=("$c")
+  done < <(nearby_devices)
+  [[ -n $demoted ]] && candidates+=("$demoted")
+  while read -r c; do
+    [[ -n $c ]] && candidates+=("$c")
+  done < <(tailnet_devices)
 
-  serial=$(grep -vxF "$(cat "$DIRECT_FILE" 2>/dev/null)" <<<"$nearby" | head -1)
-  [[ -n $serial ]] || serial=$(head -1 <<<"$nearby")
-  learn_tailnet "$serial" &>/dev/null &
-
-  if [[ $want_direct == direct && $DIRECT == auto && -n $(p2p_device) ]] && direct_allowed; then
-    if direct=$(direct_connect_locked "$serial"); then
-      printf '%s' "$direct"
-      return
+  serial=""
+  for c in "${candidates[@]}"; do
+    if phone_alive "$c"; then
+      serial=$c
+      break
     fi
-    date +%s >"$DIRECT_FAIL_FILE"
-    notify "Phone" "Couldn't set up the direct link, so this goes through your Wi-Fi router."
+    # Drop a dead connection, unless a window still uses it: a slow one
+    # isn't necessarily dead, and dropping it would cut that window too.
+    serial_in_use "$c" || adb disconnect "$c" &>/dev/null
+  done
+
+  if [[ -z $serial ]] && connect_tailscale; then
+    serial=$REMOTE_SERIAL
   fi
+  if [[ -z $serial ]]; then
+    if adb devices 2>/dev/null | grep -q $'\tunauthorized'; then
+      die "Unlock your phone and tap Allow on the USB debugging prompt."
+    fi
+    die "${REMOTE_ERROR:-No phone found. Turn on Wireless debugging, plug the phone in, or pair it from the Phone menu.}"
+  fi
+
+  case $(path_of "$serial") in
+  direct)
+    learn_tailnet "$serial" &>/dev/null &
+    ;;
+  wifi)
+    learn_tailnet "$serial" &>/dev/null &
+    if [[ $want_direct == direct && $DIRECT == auto && -n $(p2p_device) ]] && direct_allowed; then
+      if direct=$(direct_connect_locked "$serial"); then
+        printf '%s' "$direct"
+        return
+      fi
+      date +%s >"$DIRECT_FAIL_FILE"
+      notify "Phone" "Couldn't set up the direct link, so this goes through your Wi-Fi router."
+    fi
+    ;;
+  esac
   printf '%s' "$serial"
 }
 
@@ -563,6 +622,27 @@ direct_connect() {
   printf '%s' "$phone:$port"
 }
 
+# Wi-Fi interface and its channel number, for this computer's own Wi-Fi.
+wifi_iface() {
+  nmcli -t -f DEVICE,TYPE device 2>/dev/null | awk -F: '$2 == "wifi" { print $1; exit }'
+}
+
+iface_channel() {
+  iw dev "$1" info 2>/dev/null | awk '$1 == "channel" { print $2; exit }'
+}
+
+# True when the direct link and the Wi-Fi connection are on different
+# channels, which the Wi-Fi card can only serve by switching between them.
+direct_mcc() {
+  local p2p wifi a b
+  p2p=$(nmcli -g GENERAL.IP-IFACE device show "$(p2p_device)" 2>/dev/null)
+  wifi=$(wifi_iface)
+  [[ -n $p2p && -n $wifi ]] || return 1
+  a=$(iface_channel "$p2p")
+  b=$(iface_channel "$wifi")
+  [[ -n $a && -n $b && $a != "$b" ]]
+}
+
 direct_link_down() {
   nmcli connection down "$DIRECT_CON" &>/dev/null
 }
@@ -712,21 +792,26 @@ is_pinned() {
 
 # ---------------------------------------------------------------- launching
 
-# Runs scrcpy detached from whatever launched us, and reports failures.
-# PHONELINK_DRY_RUN=1 prints the scrcpy command instead.
-spawn() {
-  local runner
-  if [[ -n ${PHONELINK_DRY_RUN:-} ]]; then
-    printf 'SDL_APP_ID=%q scrcpy' "$1"
-    printf ' %q' "${@:3}"
-    echo
-    return
-  fi
+# A phone window runs as a session: it starts scrcpy, watches the link under
+# it, and starts scrcpy again when the link drops, freezes, falls behind, or
+# a better one turns up. scrcpy can't change its video settings or its
+# connection while it runs, so each of those means a new scrcpy.
 
+# Video quality steps, best first: bit rate, frame rate, and a size cap for
+# the mirror. scrcpy streams over TCP and never drops frames itself, so a
+# bit rate the link can't carry turns into delay that keeps growing.
+TIER_RATES=(16M 8M 5M 3M 1500K)
+TIER_FPS=(60 60 60 30 24)
+TIER_MIRROR_SIZE=("" "" "" 1280 1024)
+TIER_LAST=4
+
+# Runs a session detached from whatever launched us.
+spawn_session() {
+  local runner
   if command -v uwsm-app &>/dev/null; then
-    runner=(setsid -f uwsm-app -- "$SELF" __run "$@")
+    runner=(setsid -f uwsm-app -- "$SELF" __session "$@")
   else
-    runner=(setsid -f "$SELF" __run "$@")
+    runner=(setsid -f "$SELF" __session "$@")
   fi
   # The window mustn't hold the launch lock for as long as it's open.
   if [[ -n $LAUNCH_LOCK ]]; then
@@ -745,38 +830,488 @@ launch_lock() {
   flock -n "$LAUNCH_LOCK"
 }
 
+# Window sessions, by their exact arguments rather than any text that
+# merely mentions them.
+session_pids() {
+  local d argv
+  for d in /proc/[0-9]*; do
+    mapfile -d '' -t argv <"$d/cmdline" 2>/dev/null || continue
+    [[ ${argv[2]:-} == __session && ${argv[1]:-} == */phonelink ]] && echo "${d#/proc/}"
+  done
+  return 0
+}
+
+# What sessions decide, and why, for when something needs explaining.
+SESSION_LOG="$LOG_DIR/sessions.log"
+log_event() {
+  [[ -f $SESSION_LOG ]] && (($(stat -c %s "$SESSION_LOG") > 1000000)) && mv "$SESSION_LOG" "$SESSION_LOG.old"
+  printf '%s %s %s\n' "$(date '+%F %T')" "${APP_ID:-phonelink}" "$*" >>"$SESSION_LOG"
+}
+
+# A session holds its lock for as long as it runs, reconnecting included.
+session_running() {
+  local fd free=false
+  exec {fd}>"$STATE_DIR/session.$1.lock"
+  flock -n "$fd" && free=true
+  exec {fd}>&-
+  ! $free
+}
+
 wait_for_window() {
   local _
   [[ -n ${PHONELINK_DRY_RUN:-} ]] && return 0
-  for _ in {1..60}; do
+  for _ in {1..80}; do
     hyprctl clients -j 2>/dev/null | jq -e --arg c "$1" 'any(.[]; .class == $c)' &>/dev/null && return 0
     sleep 0.25
   done
   return 1
 }
 
-run_scrcpy() {
-  local app_id=$1 label=$2 log code error
-  shift 2
-  log="$LOG_DIR/$app_id.log"
+# Prints "address workspace" of the window with this class.
+window_of() {
+  hyprctl clients -j 2>/dev/null |
+    jq -r --arg c "$1" 'first(.[] | select(.class == $c) | "\(.address) \(.workspace.name)") // empty'
+}
 
-  SDL_APP_ID="$app_id" scrcpy "$@" >"$log" 2>&1
-  code=$?
+# Puts the next window of this class on the workspace the old one was on,
+# without switching to it, through a window rule that's dropped once the
+# window is up.
+place_window() {
+  local app_id=$1 workspace=$2 class
+  [[ $workspace =~ ^[A-Za-z0-9:_-]+$ ]] || return 0
+  [[ $workspace == "$(hyprctl activeworkspace -j 2>/dev/null | jq -r '.name')" ]] && return 0
+  class="^${app_id//./\\\\.}\$"
+  hyprctl eval "phonelink_rules = phonelink_rules or {}
+local old = phonelink_rules['$app_id']
+if old then old:set_enabled(false) end
+phonelink_rules['$app_id'] = hl.window_rule({ match = { class = '$class' }, workspace = '$workspace silent' })" &>/dev/null
+}
 
-  if grep -q "INJECT_EVENTS" "$log"; then
-    notify -u normal "$label" "The phone blocked mouse and keyboard input. Samsung: turn off Settings › Security and privacy › Auto Blocker. Xiaomi: turn on Developer options › USB debugging (Security settings)."
-  elif ((code >= 128)); then
-    : # closed by phonelink disconnect
-  elif ((code == 2)); then
-    notify "$label" "Phone disconnected."
-  elif ((code != 0)); then
-    error=$(grep -E "ERROR:" "$log" | tail -1 | sed 's/.*ERROR: *//')
-    notify -u normal "$label couldn't start" "${error:-See $log}"
+release_window_rule() {
+  hyprctl eval "local rule = phonelink_rules and phonelink_rules['$1']
+if rule then rule:set_enabled(false); phonelink_rules['$1'] = nil end" &>/dev/null
+}
+
+# The phone's address and port under an adb serial, to watch the link by.
+transport_of() {
+  if [[ $1 =~ ^([0-9.]+):([0-9]+)$ ]]; then
+    echo "${BASH_REMATCH[1]} ${BASH_REMATCH[2]}"
+  elif [[ $1 == *_adb-tls-connect* ]]; then
+    adb mdns services 2>/dev/null | awk -v n="${1%%._adb-tls-connect*}" \
+      '$1 == n && /_adb-tls-connect/ { split($NF, a, ":"); print a[1], a[2]; exit }'
   fi
 }
 
+# The adb server's process, to tell its connections from other programs'.
+adb_server_pid() {
+  ss -Hltnp "sport = :${ANDROID_ADB_SERVER_PORT:-5037}" 2>/dev/null | grep -oE 'pid=[0-9]+' | head -1 | cut -d= -f2
+}
+
+# Prints "idle-ms queue-ms" for the adb server's connection to the phone,
+# from the kernel's view of it: how long since data last arrived, and how
+# far the round trip has grown over its best, which is the backlog on the
+# link. $3 is the adb server's process.
+link_stats() {
+  ss -tinpH state established "( dst $1 and dport = :$2 )" 2>/dev/null | awk -v want="pid=$3," '
+    /users:\(\(/ { mine = index($0, want) > 0; next }
+    mine { for (i = 1; i <= NF; i++) {
+        n = index($i, ":"); if (!n) continue
+        k = substr($i, 1, n - 1); v = substr($i, n + 1)
+        if (k == "lastrcv") idle = v
+        else if (k == "rtt") { split(v, r, "/"); rtt = r[1] }
+        else if (k == "minrtt") min = v
+      } }
+    END { if (idle != "") printf "%d %d\n", idle, rtt - min }'
+}
+
+# Prints "serialno ssid tx-mbps" for the phone, as far as it can tell, in
+# one round trip. tx-mbps is the speed Android estimates for its Wi-Fi uplink.
+phone_info() {
+  adb -s "$1" shell 'getprop ro.serialno; cmd wifi status 2>/dev/null' 2>/dev/null | tr -d '\r' | awk '
+    NR == 1 { serial = $0 }
+    /Wifi is connected to "/ { if (match($0, /"[^"]*"/)) ssid = substr($0, RSTART + 1, RLENGTH - 2) }
+    /Calculated Tx *:/ { if (match($0, /Calculated Tx *: *[0-9]+/)) { t = substr($0, RSTART, RLENGTH); gsub(/[^0-9]/, "", t); tx = t } }
+    END {
+      gsub(/[^A-Za-z0-9]/, "", serial); gsub(/[ \t]/, "_", ssid)
+      print (serial != "" ? serial : "unknown"), (ssid != "" ? ssid : "-"), (tx != "" ? tx : 0)
+    }'
+}
+
+# Whether the phone has a hardware H.265 encoder, which keeps the picture
+# sharper at low bit rates. Checked once per phone, in the background.
+detect_hevc() {
+  local out
+  out=$(timeout 30 scrcpy -s "$1" --list-encoders --no-audio 2>&1) || return 0
+  grep -q -- '--video-codec=' <<<"$out" || return 0
+  if grep -qE -- '--video-codec=h265 .*\(hw\)' <<<"$out"; then
+    echo yes >"$STATE_DIR/hevc.$2"
+  else
+    echo no >"$STATE_DIR/hevc.$2"
+  fi
+}
+
+# The quality step that last kept up on a path and network, if any.
+quality_get() {
+  awk -v k="$1" '$1 == k { print $2; exit }' "$QUALITY_FILE" 2>/dev/null
+}
+
+quality_set() {
+  local tmp
+  tmp=$(mktemp)
+  {
+    awk -v k="$1" '$1 != k' "$QUALITY_FILE" 2>/dev/null
+    [[ -n ${2:-} ]] && echo "$1 $2"
+  } >"$tmp"
+  mv "$tmp" "$QUALITY_FILE"
+}
+
+# The quality step to start at, from how the phone is connected, how fast
+# its Wi-Fi is, what kept up on this network before, and how many other
+# phone windows share the link.
+start_tier() {
+  local path=$1 tx=$2 others=$3 key=$4 tier learned
+  case $path in
+  usb) echo 0; return ;;
+  tailscale) tier=3 ;;
+  *) tier=1 ;;
+  esac
+  if [[ $path != direct ]] && ((tx > 0)); then
+    if ((tx < 12)); then
+      tier=$((tier + 2))
+    elif ((tx < 25)); then
+      tier=$((tier + 1))
+    fi
+  fi
+  ((others > 0)) && tier=$((tier + 1))
+  learned=$(quality_get "$key")
+  [[ $learned =~ ^[0-9]+$ ]] && ((learned > tier)) && tier=$learned
+  ((tier > TIER_LAST)) && tier=$TIER_LAST
+  echo "$tier"
+}
+
+# Sets ARGS to scrcpy's arguments for a window. Your own options come after
+# the automatic ones, so they win.
+ARGS=()
+build_args() {
+  local kind=$1 pkg=$2 name=$3 serial=$4 tier=$5 hevc=$6 audio=$7 path wargs
+  path=$(path_of "$serial")
+  mapfile -t wargs < <(window_args)
+  ARGS=(-s "$serial")
+  if [[ $kind == mirror ]]; then
+    ARGS+=(--window-title="$name")
+  else
+    ARGS+=(--new-display="$(tile_size)/$APP_DPI" --flex-display --start-app="$pkg" --window-title="$name")
+  fi
+  ARGS+=("${wargs[@]}")
+
+  if [[ $ADAPT != off ]]; then
+    ARGS+=(--video-bit-rate="${TIER_RATES[tier]}" --max-fps="${TIER_FPS[tier]}")
+    ((tier >= 2)) && [[ $hevc == yes ]] && ARGS+=(--video-codec=h265)
+    # A longer audio buffer rides out Wi-Fi hiccups instead of crackling.
+    case $path in
+    wifi) ARGS+=(--audio-buffer=80) ;;
+    tailscale) ARGS+=(--audio-buffer=150) ;;
+    esac
+  fi
+
+  ARGS+=("${COMMON_ARGS[@]}")
+  if [[ $kind == mirror ]]; then
+    ARGS+=("${MIRROR_ARGS[@]}")
+    [[ $ADAPT != off && -n ${TIER_MIRROR_SIZE[tier]} ]] && ARGS+=(--max-size="${TIER_MIRROR_SIZE[tier]}")
+  else
+    ARGS+=("${APP_ARGS[@]}")
+  fi
+  [[ $path == tailscale ]] && ARGS+=("${REMOTE_ARGS[@]}")
+  [[ $audio == no ]] && ARGS+=(--no-audio)
+  return 0
+}
+
+# A clearly better way to the phone than the current one, if it's already
+# connected: USB over anything, anything nearby over Tailscale.
+better_path() {
+  local current=$1 now candidate=""
+  [[ -z $SERIAL ]] || return 1
+  now=$(path_of "$current")
+  [[ $now == usb ]] && return 1
+  candidate=$(nearby_devices | usb_devices | head -1)
+  if [[ -z $candidate && $now == tailscale ]]; then
+    candidate=$(direct_serial) || candidate=$(nearby_devices | head -1)
+  fi
+  [[ -n $candidate && $candidate != "$current" ]] && phone_alive "$candidate" || return 1
+  printf '%s' "$candidate"
+}
+
+# Finds the phone again after a drop, whichever way works, for up to $1
+# seconds. Sets RECONNECT_SERIAL.
+RECONNECT_SERIAL=""
+reconnect() {
+  local deadline=$((SECONDS + $1)) pause=1 serial
+  RECONNECT_SERIAL=""
+  while ((SECONDS < deadline)) && [[ -z $STOPPING ]]; do
+    adb reconnect offline &>/dev/null
+    serial=$(PHONELINK_QUIET=1 PHONELINK_NO_PROMPT=1 pick_device 2>/dev/null) || serial=""
+    if [[ -n $serial ]]; then
+      RECONNECT_SERIAL=$serial
+      return 0
+    fi
+    sleep "$pause" &
+    wait $!
+    ((pause < 5)) && pause=$((pause + 1))
+  done
+  return 1
+}
+
+# One notification per session, replaced as things change.
+NOTE_ID=0
+session_note() {
+  local id
+  id=$(omarchy-notification-send --app-name phonelink -g 󰄜 -u "${3:-low}" -r "$NOTE_ID" -p "$1" "$2" 2>/dev/null) || {
+    notify -u "${3:-low}" "$1" "$2"
+    return 0
+  }
+  [[ $id =~ ^[0-9]+$ ]] && NOTE_ID=$id
+  return 0
+}
+
+SCRCPY_PID=""
+STOPPING=""
+end_scrcpy() {
+  local _
+  [[ -n $SCRCPY_PID ]] || return 0
+  kill -TERM "$SCRCPY_PID" 2>/dev/null
+  for _ in {1..20}; do
+    kill -0 "$SCRCPY_PID" 2>/dev/null || return 0
+    sleep 0.1
+  done
+  kill -KILL "$SCRCPY_PID" 2>/dev/null
+  return 0
+}
+
+session() {
+  local kind=$1 pkg=$2 name=$3 serial=$4
+  local app_id=phonelink log state path serialno ssid tx key hevc audio="" tier="" others code reason
+  local host port idle queue shown=false ever_shown=false workspace="" address now last started
+  local stall cong tick changed=0 lowered=false relaunch="" next="" error hevc_retry=true
+  local workspace_now limit=50 learned server every=10
+  [[ $kind == app ]] && app_id="phonelink.$pkg"
+  APP_ID=$app_id
+  log="$LOG_DIR/$app_id.log"
+  state="$STATE_DIR/session.$app_id.state"
+
+  exec {SESSION_LOCK}>"$STATE_DIR/session.$app_id.lock"
+  flock -n "$SESSION_LOCK" || exit 0
+  trap 'STOPPING=1; end_scrcpy' TERM INT HUP
+
+  while [[ -z $STOPPING ]]; do
+    path=$(path_of "$serial")
+    read -r serialno ssid tx < <(phone_info "$serial")
+    key="$path:$ssid"
+    hevc=$(cat "$STATE_DIR/hevc.$serialno" 2>/dev/null)
+    [[ -n $hevc || $serialno == unknown ]] ||
+      (exec {SESSION_LOCK}>&-; detect_hevc "$serial" "$serialno" &>/dev/null &)
+    # Backlog, in ms, that counts as falling behind. PHONELINK_QUEUE_LIMIT
+    # overrides it for testing.
+    limit=50
+    [[ $path == tailscale ]] && limit=150
+    limit=${PHONELINK_QUEUE_LIMIT:-$limit}
+    every=10
+    [[ $path == tailscale ]] && every=3
+
+    if [[ -z $tier ]]; then
+      others=0
+      [[ $path != usb ]] && others=$(hyprctl clients -j 2>/dev/null |
+        jq --arg c "$app_id" '[.[] | select(.class | startswith("phonelink")) | select(.class != $c)] | length')
+      tier=$(start_tier "$path" "${tx:-0}" "${others:-0}" "$key")
+      if [[ $path == tailscale ]] && tailnet_relayed "${serial%:*}"; then
+        ((tier < TIER_LAST)) && tier=$((tier + 1))
+        session_note "Phone over Tailscale" "Tailscale is relaying this connection through its servers, so the video is lighter. It often finds a direct path within a minute." normal
+      fi
+    fi
+    if [[ -z $audio ]]; then
+      if audio_busy; then audio=no; else audio=yes; fi
+    fi
+
+    build_args "$kind" "$pkg" "$name" "$serial" "$tier" "$hevc" "$audio"
+    $ever_shown && place_window "$app_id" "$workspace"
+    SDL_APP_ID="$app_id" scrcpy "${ARGS[@]}" >"$log" 2>&1 &
+    SCRCPY_PID=$!
+    log_event "start: $path $serial, quality step $((tier + 1)) (${TIER_RATES[tier]}bit/s), h265=${hevc:-unknown}, audio=$audio, link ${tx:-?} Mbit/s, network $ssid"
+    echo "up $path $tier" >"$state"
+
+    read -r host port < <(transport_of "$serial")
+    server=$(adb_server_pid)
+    reason="" shown=false stall=0 cong=0 tick=0
+    started=$SECONDS last=$(date +%s)
+    while kill -0 "$SCRCPY_PID" 2>/dev/null && [[ -z $STOPPING ]]; do
+      sleep 2 &
+      wait $!
+      [[ -n $STOPPING ]] && break
+      tick=$((tick + 1))
+      now=$(date +%s)
+
+      # Test sessions without a display count as shown once scrcpy is up.
+      [[ -n ${PHONELINK_HEADLESS:-} ]] && ((SECONDS - started > 4)) && shown=true ever_shown=true
+      if ! $shown || ((tick % 3 == 0)); then
+        read -r address workspace_now < <(window_of "$app_id")
+        if [[ -n ${address:-} ]]; then
+          if ! $shown && $ever_shown; then
+            release_window_rule "$app_id"
+            [[ -n $relaunch ]] && session_note "Phone" "$relaunch"
+            relaunch=""
+          fi
+          shown=true ever_shown=true workspace=$workspace_now
+        fi
+      fi
+
+      # A long gap between checks means the computer slept, and the link
+      # may have died with it.
+      if ((now - last > 15)) && ! phone_alive "$serial"; then
+        reason=stall
+        log_event "woke from sleep with the link gone"
+        break
+      fi
+      last=$now
+
+      if [[ -n $host ]] && $shown && ((SECONDS - started > 8)); then
+        read -r idle queue < <(link_stats "$host" "$port" "$server")
+        # The phone sends a frame at least every 100 ms, even of a still
+        # screen, so seconds without data means the link is gone.
+        if [[ -z ${idle:-} ]] || ((idle > 5000)); then
+          stall=$((stall + 1))
+        else
+          stall=0
+        fi
+        if ((stall >= 2)); then
+          reason=stall
+          log_event "frozen: no data for ${idle:-?} ms"
+          break
+        fi
+
+        if [[ $ADAPT != off && -n ${queue:-} ]] && ((queue > limit)); then
+          cong=$((cong + 1))
+        elif ((cong > 0)); then
+          cong=$((cong - 1))
+        fi
+        if ((cong >= 5 && tier < TIER_LAST && SECONDS - changed >= 30)); then
+          reason=congested
+          log_event "falling behind: ${queue} ms backlog"
+          break
+        fi
+      fi
+
+      # Over Tailscale, look often: once the phone is home, its Tailscale
+      # stream tends to stall within seconds of the nearby connection
+      # appearing, so the switch has to come first.
+      if ((tick % every == 0)) && next=$(better_path "$serial"); then
+        reason=upgrade
+        log_event "better path: $next"
+        break
+      fi
+    done
+
+    [[ -n $reason ]] && end_scrcpy
+    wait "$SCRCPY_PID" 2>/dev/null
+    code=$?
+    SCRCPY_PID=""
+    log_event "scrcpy ended: code $code${reason:+, $reason}${STOPPING:+, stopping}"
+    [[ -n $STOPPING ]] && break
+
+    if grep -q "INJECT_EVENTS" "$log"; then
+      session_note "$name" "The phone blocked mouse and keyboard input. Samsung: turn off Settings › Security and privacy › Auto Blocker. Xiaomi: turn on Developer options › USB debugging (Security settings)." normal
+    fi
+
+    case $reason in
+    congested)
+      tier=$((tier + 1))
+      quality_set "$key" "$tier"
+      changed=$SECONDS
+      if ! $lowered; then
+        relaunch="Lowered the video quality to keep up with the connection."
+        lowered=true
+      fi
+      continue
+      ;;
+    upgrade)
+      serial=$next tier=""
+      relaunch="Switched to $(path_label "$(path_of "$serial")")."
+      continue
+      ;;
+    stall) ;;
+    *)
+      case $code in
+      0) break ;;
+      2) ;;
+      1)
+        if ! $ever_shown; then
+          # A phone whose H.265 encoder lets it down gets H.264 from then on.
+          if $hevc_retry && [[ " ${ARGS[*]} " == *" --video-codec=h265 "* ]]; then
+            echo no >"$STATE_DIR/hevc.$serialno"
+            hevc_retry=false
+            continue
+          fi
+          error=$(grep -E "ERROR:" "$log" | tail -1 | sed 's/.*ERROR: *//')
+          session_note "$name couldn't start" "${error:-See $log}" normal
+          break
+        fi
+        ;;
+      *) break ;;
+      esac
+      ;;
+    esac
+
+    # The link dropped or froze. Find the phone again, any way that works.
+    if ((RECONNECT_SECS <= 0)); then
+      session_note "$name" "Phone disconnected."
+      break
+    fi
+    echo "reconnecting $path $tier" >"$state"
+    session_note "Phone" "Lost the connection to your phone. Reconnecting…"
+    # Drop the connection only if the phone stopped answering on it; other
+    # windows may share it, and a frozen scrcpy doesn't mean a dead link.
+    [[ $path != usb ]] && ! phone_alive "$serial" && adb disconnect "$serial" &>/dev/null
+    if ! reconnect "$RECONNECT_SECS"; then
+      [[ -n $STOPPING ]] && break
+      session_note "Phone" "Couldn't reconnect to your phone. Check it's on Wi-Fi with Wireless debugging on, then open the window again." normal
+      break
+    fi
+    serial=$RECONNECT_SERIAL tier=""
+    log_event "reconnected: $serial"
+    relaunch="Reconnected over $(path_label "$(path_of "$serial")")."
+  done
+
+  # Quality that held up for ten minutes earns back a step next time.
+  if [[ -n ${key:-} ]] && ! $lowered && ((SECONDS >= 600)); then
+    learned=$(quality_get "$key")
+    if [[ $learned =~ ^[0-9]+$ ]]; then
+      if ((learned > 0)); then quality_set "$key" $((learned - 1)); else quality_set "$key" ""; fi
+    fi
+  fi
+  release_window_rule "$app_id"
+  rm -f "$state"
+}
+
+# Runs scrcpy once under a phonelink app id, as earlier versions did for
+# every window. Kept for scripts that start their own streams this way.
+run_plain() {
+  local app_id=$1
+  shift 2
+  SDL_APP_ID="$app_id" scrcpy "$@" >"$LOG_DIR/$app_id.log" 2>&1
+}
+
+# Prints the scrcpy command a window would run, for PHONELINK_DRY_RUN.
+dry_run() {
+  local kind=$1 pkg=$2 name=$3 serial=$4 path serialno ssid tx tier
+  path=$(path_of "$serial")
+  read -r serialno ssid tx < <(phone_info "$serial")
+  tier=$(start_tier "$path" "${tx:-0}" 0 "$path:$ssid")
+  build_args "$kind" "$pkg" "$name" "$serial" "$tier" "$(cat "$STATE_DIR/hevc.$serialno" 2>/dev/null)" yes
+  printf 'SDL_APP_ID=%q scrcpy' "$([[ $kind == mirror ]] && echo phonelink || echo "phonelink.$pkg")"
+  printf ' %q' "${ARGS[@]}"
+  echo
+}
+
 open_app() {
-  local pkg=$1 name serial args wargs
+  local pkg=$1 name serial
   valid_pkg "$pkg" || die "Not an Android package name: $pkg"
   name=$(app_name "$pkg")
 
@@ -784,18 +1319,18 @@ open_app() {
     record_recent "$pkg"
     return
   fi
+  if session_running "phonelink.$pkg"; then
+    notify "Phone" "$name is reconnecting to your phone."
+    return 0
+  fi
   launch_lock "phonelink.$pkg" || return 0
 
   serial=$(pick_device direct) || exit 1
-  mapfile -t wargs < <(window_args)
-  args=(-s "$serial" --new-display="$(tile_size)/$APP_DPI" --flex-display --start-app="$pkg"
-    --window-title="$name" "${wargs[@]}" "${COMMON_ARGS[@]}" "${APP_ARGS[@]}")
-  is_tailnet_serial "$serial" && args+=("${REMOTE_ARGS[@]}")
-  audio_busy && args+=(--no-audio)
-
-  spawn "phonelink.$pkg" "$name" "${args[@]}"
-  [[ -n ${PHONELINK_DRY_RUN:-} ]] && return
-  warn_if_relayed "$serial"
+  if [[ -n ${PHONELINK_DRY_RUN:-} ]]; then
+    dry_run app "$pkg" "$name" "$serial"
+    return
+  fi
+  spawn_session app "$pkg" "$name" "$serial"
 
   # Only an app that actually opened becomes recent.
   wait_for_window "phonelink.$pkg" || return 0
@@ -805,31 +1340,22 @@ open_app() {
 }
 
 mirror() {
-  local serial label args wargs
+  local serial label
   focus_class "phonelink" && return
+  if session_running "phonelink"; then
+    notify "Phone" "The mirror is reconnecting to your phone."
+    return 0
+  fi
   launch_lock "phonelink" || return 0
 
   serial=$(pick_device direct) || exit 1
   label=$(device_label "$serial")
-  mapfile -t wargs < <(window_args)
-  args=(-s "$serial" --window-title="$label" "${wargs[@]}" "${COMMON_ARGS[@]}" "${MIRROR_ARGS[@]}")
-  is_tailnet_serial "$serial" && args+=("${REMOTE_ARGS[@]}")
-  audio_busy && args+=(--no-audio)
-
-  spawn "phonelink" "$label" "${args[@]}"
-  [[ -n ${PHONELINK_DRY_RUN:-} ]] && return
-  warn_if_relayed "$serial"
+  if [[ -n ${PHONELINK_DRY_RUN:-} ]]; then
+    dry_run mirror "" "$label" "$serial"
+    return
+  fi
+  spawn_session mirror "" "$label" "$serial"
   wait_for_window "phonelink"
-}
-
-# Checks the Tailscale path in the background, once the window is on its way.
-warn_if_relayed() {
-  is_tailnet_serial "$1" || return 0
-  (
-    exec {LAUNCH_LOCK}>&-
-    tailnet_relayed "${1%:*}" &&
-      notify -u normal "Phone over Tailscale" "Tailscale is relaying this connection through its servers, so expect lag. It often finds a direct path within a minute."
-  ) &>/dev/null &
 }
 
 choose_app() {
@@ -1031,8 +1557,17 @@ connect() {
 }
 
 disconnect() {
-  local pid serial
-  # Close the phone windows phonelink opened, then drop the Wi-Fi links.
+  local pid serial _
+  # End the window sessions, so they don't reconnect, then close any phone
+  # window left, then drop the Wi-Fi links.
+  for pid in $(session_pids); do
+    pkill -TERM -P "$pid" 2>/dev/null
+    kill -TERM "$pid" 2>/dev/null
+  done
+  for _ in {1..30}; do
+    [[ -n $(session_pids) ]] || break
+    sleep 0.1
+  done
   for pid in $(pgrep -x scrcpy); do
     tr '\0' '\n' <"/proc/$pid/environ" 2>/dev/null | grep -q '^SDL_APP_ID=phonelink' && kill "$pid"
   done
@@ -1058,7 +1593,7 @@ disconnect() {
 }
 
 status() {
-  local ip port
+  local ip port f app state path tier
   adb start-server &>/dev/null
   echo "Connected phones:"
   adb devices -l | tail -n +2 | grep . || echo "  none"
@@ -1074,6 +1609,13 @@ status() {
     echo "Tailscale: not seen yet (connect the phone nearby once)"
   fi
   [[ -s $APPS_CACHE ]] && echo "Cached apps: $(wc -l <"$APPS_CACHE")"
+  for f in "$STATE_DIR"/session.*.state; do
+    [[ -f $f ]] || continue
+    app=${f##*/session.}
+    app=${app%.state}
+    read -r state path tier <"$f"
+    echo "Window $app: $state over $(path_label "$path"), quality step $((tier + 1)) of $((TIER_LAST + 1)) (${TIER_RATES[tier]}bit/s)"
+  done
 }
 
 usage() {
@@ -1090,7 +1632,8 @@ adb_running() {
 
 # State for the bar widget, as JSON. --brief skips asking the phone its name.
 status_json() {
-  local via=none serial="" name="" direct=false supported=false mirror=false relayed=false nearby classes apps pkg icon f
+  local via=none serial="" name="" direct=false supported=false mirror=false relayed=false reconnecting=false
+  local nearby classes apps pkg icon f app
   [[ -n $(p2p_device) ]] && supported=true
   direct_link_up && direct=true
 
@@ -1110,6 +1653,12 @@ status_json() {
     fi
     [[ $via == none || ${1:-} == --brief ]] || name=$(device_label "$serial")
   fi
+
+  for f in "$STATE_DIR"/session.*.state; do
+    [[ -f $f && $(cut -d' ' -f1 "$f") == reconnecting ]] || continue
+    app=${f##*/session.}
+    session_running "${app%.state}" && reconnecting=true
+  done
 
   classes=$(hyprctl clients -j 2>/dev/null | jq -r '.[].class' | grep '^phonelink' || true)
   grep -qxF phonelink <<<"$classes" && mirror=true
@@ -1134,43 +1683,182 @@ status_json() {
   )
 
   jq -n --arg via "$via" --arg name "$name" --argjson direct "$direct" --argjson supported "$supported" \
-    --argjson mirror "$mirror" --argjson relayed "$relayed" --argjson apps "${apps:-[]}" \
-    '{ connected: ($via != "none"), via: $via, relayed: $relayed, name: $name, direct: $direct,
+    --argjson mirror "$mirror" --argjson relayed "$relayed" --argjson reconnecting "$reconnecting" \
+    --argjson apps "${apps:-[]}" \
+    '{ connected: ($via != "none"), via: $via, relayed: $relayed, reconnecting: $reconnecting, name: $name, direct: $direct,
        directSupported: $supported, mirrorOpen: $mirror, apps: $apps }'
+}
+
+# ---------------------------------------------------------------- doctor
+
+# Checks the usual causes of lag and dropouts, and says what to do about each.
+doctor() {
+  local serial="" path="" wifi link freq signal bssid ps con st rssi tx pfreq pbssid serialno hevc decode k t
+  say() { printf '  %s %s\n' "$1" "$2"; }
+
+  echo "Phone"
+  adb start-server &>/dev/null
+  if serial=$(PHONELINK_QUIET=1 PHONELINK_NO_PROMPT=1 pick_device 2>/dev/null); then
+    path=$(path_of "$serial")
+    say "✓" "Connected over $(path_label "$path") ($serial)"
+  else
+    serial=""
+    say "!" "No phone connected. Turn on Wireless debugging, or plug the phone in."
+  fi
+
+  echo
+  echo "This computer's Wi-Fi"
+  wifi=$(wifi_iface)
+  link=$( [[ -n $wifi ]] && iw dev "$wifi" link 2>/dev/null)
+  if [[ $link == Connected* ]]; then
+    freq=$(awk '$1 == "freq:" { print int($2); exit }' <<<"$link")
+    signal=$(awk '$1 == "signal:" { print $2; exit }' <<<"$link")
+    bssid=$(awk '$1 == "Connected" { print $3; exit }' <<<"$link")
+    if ((freq < 3000)); then
+      say "!" "On 2.4 GHz, which is slower and more crowded. Use your router's 5 GHz network if it has one."
+    else
+      say "✓" "On 5 GHz or above ($freq MHz)"
+    fi
+    if ((signal < -70)); then
+      say "!" "Weak signal ($signal dBm). Moving closer to the router helps."
+    else
+      say "✓" "Signal $signal dBm"
+    fi
+    ps=$(iw dev "$wifi" get power_save 2>/dev/null | awk '{ print $NF }')
+    if [[ $ps == on ]]; then
+      con=$(nmcli -t -f NAME,DEVICE connection show --active 2>/dev/null | awk -F: -v d="$wifi" '$2 == d { print $1; exit }')
+      say "!" "Wi-Fi power saving is on, a common cause of lag spikes. To turn it off:"
+      echo "      nmcli connection modify \"$con\" 802-11-wireless.powersave 2 && nmcli connection up \"$con\""
+    else
+      say "✓" "Wi-Fi power saving is off"
+    fi
+  else
+    say "✓" "Not on Wi-Fi"
+  fi
+
+  if [[ -n $serial && $path != usb ]]; then
+    echo
+    echo "The phone's Wi-Fi"
+    st=$(adb -s "$serial" shell cmd wifi status 2>/dev/null | tr -d '\r')
+    if grep -q "Wifi is connected" <<<"$st"; then
+      rssi=$(grep -oE 'RSSI: -?[0-9]+' <<<"$st" | head -1 | grep -oE -- '-?[0-9]+$')
+      tx=$(grep -oE 'Calculated Tx *: *[0-9]+' <<<"$st" | head -1 | grep -oE '[0-9]+$')
+      pfreq=$(grep -oE 'Frequency: [0-9]+' <<<"$st" | head -1 | grep -oE '[0-9]+$')
+      pbssid=$(grep -oE 'BSSID: [0-9a-fA-F:]{17}' <<<"$st" | head -1 | awk '{ print $2 }')
+      if [[ -n $rssi ]]; then
+        if ((rssi < -70)); then say "!" "Weak signal ($rssi dBm), which slows its uplink."; else say "✓" "Signal $rssi dBm"; fi
+      fi
+      if [[ -n $tx ]]; then
+        if ((tx < 25)); then
+          say "!" "Its Wi-Fi uplink carries about $tx Mbit/s, so phonelink keeps the video light."
+        else
+          say "✓" "Uplink about $tx Mbit/s"
+        fi
+      fi
+      [[ -n $pfreq ]] && ((pfreq < 3000)) && say "!" "On 2.4 GHz. Its 5 GHz network would be faster."
+      if [[ $path != tailscale && -n $pbssid && -n ${bssid:-} && ${pbssid,,} != "${bssid,,}" ]]; then
+        say "!" "The phone and this computer use different access points, so video crosses between them. Fine over a wired mesh, slower over a wireless one."
+      fi
+    else
+      say "!" "The phone isn't on Wi-Fi. Android turns Wireless debugging off without it."
+    fi
+  fi
+
+  echo
+  echo "Direct Wi-Fi link"
+  if [[ -z $(p2p_device) ]]; then
+    say "✓" "Not available here (it needs NetworkManager with wpa_supplicant)"
+  elif direct_link_up; then
+    if direct_mcc; then
+      say "!" "Up, but on another channel than your Wi-Fi, so the two share the radio. phonelink uses the router while that lasts."
+    else
+      say "✓" "Up, on the same channel as your Wi-Fi"
+    fi
+  else
+    say "✓" "Down. It's set up when a window opens over Wi-Fi."
+  fi
+
+  if [[ $path == tailscale ]]; then
+    echo
+    echo "Tailscale"
+    if tailnet_relayed "${serial%:*}"; then
+      say "!" "Relayed through Tailscale's servers, which adds lag. A direct connection needs UDP to get through on both networks."
+    else
+      say "✓" "Direct connection"
+    fi
+  fi
+
+  echo
+  echo "Video"
+  if [[ -n $serial ]]; then
+    serialno=$(adb -s "$serial" shell getprop ro.serialno 2>/dev/null | tr -cd 'A-Za-z0-9')
+    hevc=$(cat "$STATE_DIR/hevc.$serialno" 2>/dev/null)
+    case $hevc in
+    yes) say "✓" "The phone has a hardware H.265 encoder, used to keep slow links sharp" ;;
+    no) say "✓" "No hardware H.265 encoder on the phone, so H.264 throughout" ;;
+    *) say "✓" "The phone's encoders get checked when the next window opens" ;;
+    esac
+  fi
+  decode=$(grep -h "Video decoding:" "$LOG_DIR"/*.log 2>/dev/null | tail -1 | awk '{ print $NF }')
+  case $decode in
+  "") ;;
+  software) say "!" "This computer decodes the video in software. Installing your GPU's VA-API driver (libva-mesa-driver, intel-media-driver or nvidia-vaapi-driver) takes the load off the CPU." ;;
+  *) say "✓" "This computer decodes the video in hardware ($decode)" ;;
+  esac
+  if grep -qs "INJECT_EVENTS" "$LOG_DIR"/*.log; then
+    say "!" "The phone blocked mouse and keyboard input before. Samsung: turn off Settings › Security and privacy › Auto Blocker."
+  fi
+
+  if [[ -s $QUALITY_FILE ]]; then
+    echo
+    echo "Quality learned per network"
+    while read -r k t; do
+      [[ $t =~ ^[0-9]+$ ]] && ((t <= TIER_LAST)) || continue
+      say "✓" "${k/:/ on }: step $((t + 1)) of $((TIER_LAST + 1)) (${TIER_RATES[t]}bit/s)"
+    done <"$QUALITY_FILE"
+  fi
 }
 
 # ---------------------------------------------------------------- main
 
-cmd=${1:-menu}
-shift || true
+main() {
+  local cmd=${1:-menu} serial
+  shift || true
 
-case $cmd in
-__run) run_scrcpy "$@" ;;
-menu) omarchy-menu summon phone ;;
-apps) require_tools; choose_app ;;
-open) require_tools; open_app "${1:?Usage: phonelink open <package>}" ;;
-mirror) require_tools; mirror ;;
-pin) require_tools; pin_menu ;;
-pair) require_tools; pair ;;
-connect) require_tools; connect "${1:-}" ;;
-direct) require_tools; direct "${1:-on}" ;;
-wifi) require_tools; wifi ;;
-stop | disconnect) require_tools; disconnect ;;
-refresh)
-  require_tools
-  serial=$(pick_device) || exit 1
-  refresh_apps "$serial"
-  echo "Apps: $(wc -l <"$APPS_CACHE")"
-  notify "Phone" "Found $(wc -l <"$APPS_CACHE") apps on your phone."
-  ;;
-status)
-  if [[ ${1:-} == --json ]]; then
-    status_json "${2:-}"
-  else
+  case $cmd in
+  __session) session "$@" ;;
+  __run) run_plain "$@" ;;
+  menu) omarchy-menu summon phone ;;
+  apps) require_tools; choose_app ;;
+  open) require_tools; open_app "${1:?Usage: phonelink open <package>}" ;;
+  mirror) require_tools; mirror ;;
+  pin) require_tools; pin_menu ;;
+  pair) require_tools; pair ;;
+  connect) require_tools; connect "${1:-}" ;;
+  direct) require_tools; direct "${1:-on}" ;;
+  wifi) require_tools; wifi ;;
+  stop | disconnect) require_tools; disconnect ;;
+  doctor) require_tools; doctor ;;
+  refresh)
     require_tools
-    status
-  fi
-  ;;
--h | --help | help) usage ;;
-*) usage; exit 1 ;;
-esac
+    serial=$(pick_device) || exit 1
+    refresh_apps "$serial"
+    echo "Apps: $(wc -l <"$APPS_CACHE")"
+    notify "Phone" "Found $(wc -l <"$APPS_CACHE") apps on your phone."
+    ;;
+  status)
+    if [[ ${1:-} == --json ]]; then
+      status_json "${2:-}"
+    else
+      require_tools
+      status
+    fi
+    ;;
+  -h | --help | help) usage ;;
+  *) usage; exit 1 ;;
+  esac
+}
+
+# On one line, so a window session that runs for hours never reads on into a
+# newer copy of this file installed meanwhile.
+main "$@"; exit $?

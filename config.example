@@ -18,8 +18,16 @@
 # page, which tells Google the app's package name. "off" uses a generic icon.
 # APP_ICONS="play"
 
-# Extra scrcpy options (see `scrcpy --help`).
-# COMMON_ARGS=(--video-bit-rate=10M)
+# Video quality follows the connection by itself (auto). "off" uses scrcpy's
+# defaults plus your options below.
+# ADAPT="auto"
+# How long a window that lost its connection keeps trying to come back, in
+# seconds. 0 closes it instead.
+# RECONNECT_SECS=120
+
+# Extra scrcpy options (see `scrcpy --help`). They override the automatic
+# quality, so a fixed bit rate here turns the adapting off for it:
+# COMMON_ARGS=(--video-bit-rate=8M)
 # Show the phone keyboard and IME candidates inside app windows instead of on the phone:
 # APP_ARGS=(--no-vd-system-decorations --keep-active --display-ime-policy=local)
 # Mirror resolution cap, in pixels on the long side. Lower is snappier over Wi-Fi.
@@ -32,5 +40,5 @@
 # The phone's Tailscale name, if phonelink can't work it out (for example with
 # several Android devices on the tailnet):
 # TAILSCALE_HOST="my-phone"
-# Lighter video over Tailscale, where bandwidth is usually lower:
-# REMOTE_ARGS=(--video-bit-rate=4M --max-fps=30)
+# Extra scrcpy options over Tailscale only:
+# REMOTE_ARGS=(--max-size=1280)

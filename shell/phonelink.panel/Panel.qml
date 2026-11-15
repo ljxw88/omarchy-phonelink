@@ -32,6 +32,7 @@ Panel {
   property bool connected: false
   property string via: "none"
   property bool relayed: false
+  property bool reconnecting: false
   property string deviceName: ""
   property bool directUp: false
   property bool directSupported: false
@@ -59,10 +60,12 @@ Panel {
     : via === "tailscale" ? (relayed ? strings.t("viaTailscaleRelayed") : strings.t("viaTailscale"))
     : strings.t("notConnected")
 
-  readonly property string statusLabel: !loaded ? strings.t("checking") : viaLabel
+  readonly property string statusLabel: !loaded ? strings.t("checking")
+    : reconnecting ? strings.t("reconnecting")
+    : viaLabel
 
-  readonly property string tooltip: connected
-    ? strings.t("tooltipConnected").arg(deviceName || strings.t("phone")).arg(viaLabel)
+  readonly property string tooltip: connected || reconnecting
+    ? strings.t("tooltipConnected").arg(deviceName || strings.t("phone")).arg(statusLabel)
     : strings.t("tooltipDisconnected")
 
   // One flat list drives both the mouse and the keyboard cursor. Groups:
@@ -199,6 +202,7 @@ Panel {
       connected: !!data.connected,
       via: ["direct", "wifi", "usb", "tailscale"].indexOf(data.via) >= 0 ? data.via : "none",
       relayed: !!data.relayed,
+      reconnecting: !!data.reconnecting,
       name: typeof data.name === "string" ? data.name.slice(0, 80) : "",
       direct: !!data.direct,
       directSupported: !!data.directSupported,
@@ -213,6 +217,7 @@ Panel {
     connected = status.connected
     via = status.via
     relayed = status.relayed
+    reconnecting = status.reconnecting
     if (status.name !== "") deviceName = status.name
     directUp = status.direct
     directSupported = status.directSupported

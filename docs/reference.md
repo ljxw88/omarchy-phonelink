@@ -10,6 +10,7 @@
 - [Settings](#settings)
 - [The direct Wi-Fi link](#the-direct-wi-fi-link)
 - [Away from home (Tailscale)](#away-from-home-tailscale)
+- [Staying smooth and connected](#staying-smooth-and-connected)
 - [Troubleshooting](#troubleshooting)
 - [Privacy](#privacy)
 
@@ -96,7 +97,8 @@ phonelink direct off   Drop the direct link
 phonelink wifi         Switch a USB-connected phone to Wi-Fi
 phonelink stop         Close phone windows and drop all connections
 phonelink refresh      Re-read the app list from the phone
-phonelink status       Show connected phones
+phonelink status       Show connected phones and open windows
+phonelink doctor       Check for common causes of lag and dropouts
 ```
 
 ## Settings
@@ -112,10 +114,12 @@ phonelink status       Show connected phones
 | `SERIAL` | | Use this phone when several are connected |
 | `TAILSCALE` | `auto` | `off` never reaches the phone over Tailscale |
 | `TAILSCALE_HOST` | | The phone's Tailscale name, if phonelink can't work it out |
-| `REMOTE_ARGS` | `(--video-bit-rate=4M --max-fps=30)` | Extra scrcpy options over Tailscale |
+| `REMOTE_ARGS` | | Extra scrcpy options over Tailscale |
+| `ADAPT` | `auto` | `off` uses scrcpy's own defaults instead of fitting the quality to the connection |
+| `RECONNECT_SECS` | `120` | How long a window that lost its connection keeps trying; `0` closes it |
 | `MIRROR_ARGS` | `(--max-size=1600)` | Extra scrcpy options for the mirror |
 | `APP_ARGS` | | Extra scrcpy options for app windows |
-| `COMMON_ARGS` | `(--video-bit-rate=10M)` | Extra scrcpy options for both |
+| `COMMON_ARGS` | | Extra scrcpy options for both. They override the automatic quality |
 
 To float the mirror instead of tiling it, uncomment the last line of
 `~/.config/hypr/phonelink.lua`.
@@ -157,20 +161,82 @@ The phone then listens on port 5555 until it restarts, on any network,
 including mobile data. phonelink tries that port over Tailscale. A computer the
 phone hasn't allowed before has to be approved on the phone's screen.
 
-**Speed:** video is lighter over Tailscale (`REMOTE_ARGS`), and the direct Wi-Fi
-link is off, since the phone isn't nearby. How smooth it is depends on the
+**Speed:** video starts lighter over Tailscale, and the direct Wi-Fi link is
+off, since the phone isn't nearby. How smooth it is depends on the
 upload speed where the phone is. If Tailscale can't make a direct connection
 and relays traffic through its servers, phonelink warns you, and the bar shows
 "Tailscale · relayed". Expect lag then.
 
+## Staying smooth and connected
+
+scrcpy sends video over TCP at a fixed bit rate and never drops frames. When
+the connection can't carry that rate, the picture doesn't get worse; it gets
+later, and the delay keeps growing. scrcpy also can't change its settings or
+its connection while it runs. So phonelink runs each window as a session that
+watches the connection from outside and restarts scrcpy when something has to
+change. A restart takes a second or two.
+
+**Quality levels**
+
+| Step | Bit rate | Frame rate | Used for |
+|---|---|---|---|
+| 1 | 16 Mbit/s | 60 | USB |
+| 2 | 8 Mbit/s | 60 | The direct link or a good Wi-Fi network |
+| 3 | 5 Mbit/s | 60 | A slower Wi-Fi uplink, or several windows at once |
+| 4 | 3 Mbit/s | 30 | Tailscale |
+| 5 | 1.5 Mbit/s | 24 | Relayed Tailscale, or links that keep falling behind |
+
+From step 3 down, phones with a hardware H.265 encoder use it, which keeps the
+picture sharper at the same bit rate. The mirror also gets smaller at steps 4
+and 5.
+
+**Choosing the start:** a window starts from how the phone is connected, the
+uplink speed Android reports for its Wi-Fi, how many other phone windows share
+the link, and what kept up on this network before.
+
+**Falling behind:** phonelink reads the connection's round-trip time from the
+kernel every 2 seconds. When it stays well above its best (50 ms over it
+nearby, 150 ms over Tailscale) for about 10 seconds, the window restarts one
+step lower. The step is remembered for that network. After 10 minutes without
+trouble, the next window there starts a step higher again.
+
+**Dropouts:** the phone sends a frame at least every 100 ms, even of a still
+screen. When no data arrives for 5 seconds twice in a row, or the window closes
+because the phone went away, phonelink finds the phone again by whatever way
+works: USB, the direct link, your Wi-Fi, or Tailscale. It keeps trying for
+`RECONNECT_SECS` (2 minutes by default). The window comes back on the workspace
+it was on, without switching your view. App windows reopen the app, which most
+apps resume where they were. The same happens after this computer wakes from
+sleep.
+
+**Better paths:** every 20 seconds, phonelink checks for a faster way to the
+phone. Plugging the phone in moves the windows to USB, and coming home moves
+them from Tailscale to your Wi-Fi.
+
+**The direct link:** when it ends up on a different Wi-Fi channel than your
+network, the Wi-Fi card has to switch between the two, which slows both. Then
+phonelink uses the router instead.
+
+**Sound:** over Wi-Fi and Tailscale, phonelink buffers a little more audio, so
+short hiccups don't crackle.
+
+**What phonelink can't fix:** Android's low-latency Wi-Fi mode needs a rooted
+phone. A connection that's simply too slow stays slow; `phonelink doctor`
+points out the usual causes, such as Wi-Fi power saving, 2.4 GHz, a weak signal,
+or the phone and computer on different access points.
+
+What each window decided, and why, is logged in
+`~/.local/state/phonelink/logs/sessions.log`.
+
 ## Troubleshooting
+
+- **Laggy, or keeps reconnecting.** Run `phonelink doctor`, or
+  **Omarchy menu › Phone › Check connection**. It checks both Wi-Fi
+  connections, the direct link and Tailscale, and says what to change.
 
 - **No phone found.** Check that Wireless debugging is on. Android turns it off
   when the phone restarts or changes Wi-Fi network. A quick-settings tile helps:
   **Developer options › Quick settings developer tiles › Wireless debugging**.
-- **Laggy over Wi-Fi.** Check that the direct link is up (`phonelink status`).
-  If it can't be set up, lower `--max-size` or the bit rate in the config. USB
-  is the fastest option.
 - **The direct link won't connect.** Keep the phone unlocked and nearby while
   it's set up.
 - **Can't reach the phone away from home.** Check that the Tailscale app on the
@@ -187,7 +253,8 @@ and relays traffic through its servers, phonelink warns you, and the bar shows
   debugging is on. If an emulator or a USB device is connected, adb stays up for
   them, and the phone may reconnect.
 
-Each window's log is in `~/.local/state/phonelink/logs/`.
+Each window's scrcpy log is in `~/.local/state/phonelink/logs/`, beside
+`sessions.log`.
 
 ## Privacy
 
