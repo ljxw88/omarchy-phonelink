@@ -334,7 +334,7 @@ pick_device() {
     if adb devices 2>/dev/null | grep -q $'\tunauthorized'; then
       die "Unlock your phone and tap Allow on the USB debugging prompt."
     fi
-    die "${REMOTE_ERROR:-No phone found. Turn on Wireless debugging, plug the phone in, or pair it from the Phone menu.}"
+    die "${REMOTE_ERROR:-No phone found · turn on Wireless debugging}"
   fi
 
   case $(path_of "$serial") in
@@ -349,7 +349,7 @@ pick_device() {
         return
       fi
       date +%s >"$DIRECT_FAIL_FILE"
-      notify "Phone" "Couldn't set up the direct link, so this goes through your Wi-Fi router."
+      notify "Phone" "Direct link failed · using Wi-Fi"
     fi
     ;;
   esac
@@ -579,7 +579,7 @@ direct_connect() {
 
   adb -s "$serial" shell input keyevent KEYCODE_WAKEUP &>/dev/null
   if phone_locked "$serial"; then
-    notify -u normal "Phone" "Unlock your phone to set up the fast direct link."
+    notify -u normal "Phone" "Unlock your phone"
     for _ in {1..30}; do
       sleep 1
       phone_locked "$serial" || break
@@ -587,7 +587,7 @@ direct_connect() {
     phone_locked "$serial" && return 1
   fi
 
-  notify "Phone" "Setting up a direct Wi-Fi link to your phone. Tap Connect on the phone if it asks."
+  notify "Phone" "Linking directly… tap Connect if the phone asks"
   name=$(adb -s "$serial" shell settings get global device_name 2>/dev/null | tr -d '\r')
   known=$(cat "$DIRECT_PEER_FILE" 2>/dev/null)
   ours=$(our_p2p_address)
@@ -699,22 +699,22 @@ direct() {
   case $1 in
   off)
     direct_disconnect
-    notify "Phone" "Direct link closed."
+    notify "Phone" "Direct link off"
     ;;
   *)
     if direct=$(direct_serial); then
-      notify "Phone" "Direct link is already up."
+      notify "Phone" "Direct link on"
       return
     fi
-    [[ -n $(p2p_device) ]] || die "This computer can't do Wi-Fi Direct. It needs NetworkManager with wpa_supplicant and a Wi-Fi card that supports it."
+    [[ -n $(p2p_device) ]] || die "No Wi-Fi Direct here · needs NetworkManager with wpa_supplicant"
     serial=$(pick_device) || exit 1
-    [[ $serial == *:* || $serial == *_adb-tls-connect* ]] || die "Your phone is on USB, which is already the fastest link."
-    is_tailnet_serial "$serial" && die "Your phone is connected over Tailscale. The direct link only works when it's next to this computer."
+    [[ $serial == *:* || $serial == *_adb-tls-connect* ]] || die "On USB · already the fastest"
+    is_tailnet_serial "$serial" && die "Over Tailscale · the direct link needs the phone nearby"
     rm -f "$DIRECT_FAIL_FILE"
     if direct=$(direct_connect_locked "$serial"); then
-      notify "Phone" "Direct link is up. Phone windows now skip your Wi-Fi router."
+      notify "Phone" "Direct link on"
     else
-      die "Couldn't set up the direct link. Keep the phone unlocked and close by, then try again."
+      die "Direct link failed · keep the phone unlocked and nearby"
     fi
     ;;
   esac
@@ -1188,7 +1188,7 @@ sound_cmd() {
 
   if ! $open; then
     sound_unlock
-    [[ $new == pc ]] && body="Opens with its sound on this computer." || body="Opens with its sound on the phone."
+    [[ $new == pc ]] && body="Will play here" || body="Will play on the phone"
     notify "$title" "$body"
     return
   fi
@@ -1199,7 +1199,7 @@ sound_cmd() {
 
   # sound_start has already said why if the sound couldn't come here.
   [[ $now == "$new" ]] || return 1
-  [[ $new == pc ]] && body="Sound now plays on this computer." || body="Sound now plays on the phone."
+  [[ $new == pc ]] && body="Playing here" || body="Playing on the phone"
   if (($(open_window_keys | wc -l) > 1)); then
     body+=" Phone windows share one sound, so this goes for all of them."
   fi
@@ -1574,7 +1574,7 @@ session() {
       tier=$(start_tier "$path" "${tx:-0}" "${others:-0}" "$key")
       if [[ $path == tailscale ]] && tailnet_relayed "${serial%:*}"; then
         ((tier < TIER_LAST)) && tier=$((tier + 1))
-        session_note "Phone over Tailscale" "Tailscale is relaying this connection through its servers, so the video is lighter. It often finds a direct path within a minute." normal
+        session_note "Phone over Tailscale" "Relayed · lighter video for now" normal
       fi
     fi
     build_args "$kind" "$pkg" "$name" "$serial" "$tier" "$hevc"
@@ -1664,7 +1664,7 @@ session() {
     [[ -n $STOPPING ]] && break
 
     if grep -q "INJECT_EVENTS" "$log"; then
-      session_note "$name" "The phone blocked mouse and keyboard input. Samsung: turn off Settings › Security and privacy › Auto Blocker. Xiaomi: turn on Developer options › USB debugging (Security settings)." normal
+      session_note "$name" "Input blocked · Samsung: turn off Auto Blocker" normal
     fi
 
     case $reason in
@@ -1673,14 +1673,14 @@ session() {
       quality_set "$key" "$tier"
       changed=$SECONDS
       if ! $lowered; then
-        relaunch="Lowered the video quality to keep up with the connection."
+        relaunch="Lower quality · keeping up"
         lowered=true
       fi
       continue
       ;;
     upgrade)
       serial=$next tier=""
-      relaunch="Switched to $(path_label "$(path_of "$serial")")."
+      relaunch="Now on $(path_label "$(path_of "$serial")")"
       continue
       ;;
     stall) ;;
@@ -1708,22 +1708,22 @@ session() {
 
     # The link dropped or froze. Find the phone again, any way that works.
     if ((RECONNECT_SECS <= 0)); then
-      session_note "$name" "Phone disconnected."
+      session_note "$name" "Disconnected"
       break
     fi
     echo "reconnecting $path $tier" >"$state"
-    session_note "Phone" "Lost the connection to your phone. Reconnecting…"
+    session_note "Phone" "Reconnecting…"
     # Drop the connection only if the phone stopped answering on it; other
     # windows may share it, and a frozen scrcpy doesn't mean a dead link.
     [[ $path != usb ]] && ! phone_alive "$serial" && adb disconnect "$serial" &>/dev/null
     if ! reconnect "$RECONNECT_SECS"; then
       [[ -n $STOPPING ]] && break
-      session_note "Phone" "Couldn't reconnect to your phone. Check it's on Wi-Fi with Wireless debugging on, then open the window again." normal
+      session_note "Phone" "Couldn't reconnect · check Wireless debugging" normal
       break
     fi
     serial=$RECONNECT_SERIAL tier=""
     log_event "reconnected: $serial"
-    relaunch="Reconnected over $(path_label "$(path_of "$serial")")."
+    relaunch="Reconnected · $(path_label "$(path_of "$serial")")"
   done
 
   # Quality that held up for ten minutes earns back a step next time.
@@ -1768,7 +1768,7 @@ open_app() {
     return
   fi
   if session_running "phonelink.$pkg"; then
-    notify "Phone" "$name is reconnecting to your phone."
+    notify "Phone" "$name · reconnecting…"
     return 0
   fi
   launch_lock "phonelink.$pkg" || return 0
@@ -1792,7 +1792,7 @@ mirror() {
   local serial label
   focus_class "phonelink" && return
   if session_running "phonelink"; then
-    notify "Phone" "The mirror is reconnecting to your phone."
+    notify "Phone" "Mirror · reconnecting…"
     return 0
   fi
   launch_lock "phonelink" || return 0
@@ -1813,7 +1813,7 @@ choose_app() {
 
   if [[ ! -s $APPS_CACHE ]]; then
     serial=$(pick_device) || exit 1
-    notify "Phone" "Reading apps from your phone…"
+    notify "Phone" "Reading apps…"
     refresh_apps "$serial"
   fi
 
@@ -1833,7 +1833,7 @@ choose_app() {
   "Mirror whole screen") mirror ;;
   "Refresh app list")
     serial=$(pick_device) || exit 1
-    notify "Phone" "Reading apps from your phone…"
+    notify "Phone" "Reading apps…"
     refresh_apps "$serial"
     choose_app
     ;;
@@ -1846,7 +1846,7 @@ pin_menu() {
 
   if [[ ! -s $APPS_CACHE ]]; then
     serial=$(pick_device) || exit 1
-    notify "Phone" "Reading apps from your phone…"
+    notify "Phone" "Reading apps…"
     refresh_apps "$serial"
   fi
 
@@ -1867,7 +1867,7 @@ pin_menu() {
   done <"$APPS_CACHE"
 
   update-desktop-database "$DESKTOP_DIR" &>/dev/null || true
-  notify "Phone" "Pinned phone apps are in the app launcher."
+  notify "Phone" "Pinned to the launcher"
 }
 
 # ---------------------------------------------------------------- Wi-Fi
@@ -1891,23 +1891,22 @@ finish_pairing() {
   local ip=$1 addr
   echo
   if ! wait_for_wireless "$ip"; then
-    echo "Paired, but the phone didn't connect by itself."
-    read -rp "IP address & port shown at the top of Wireless debugging: " addr
+    echo "Paired. Enter the address shown at the top of Wireless debugging."
+    read -rp "IP address & port: " addr
     adb connect "$addr" | grep -q "connected to" || {
       echo "Couldn't connect to $addr."
       return 1
     }
   fi
-  echo -e "\e[32m✓ Connected.\e[0m The phone reconnects by itself whenever Wireless debugging is on."
-  echo "Open phone apps with Super + Alt + P."
+  echo -e "\e[32m✓ Connected\e[0m"
 }
 
 pair_manual() {
   local addr code
   echo
-  echo "On the phone, tap 'Pair device with pairing code'."
-  read -rp "IP address & port shown there: " addr
-  read -rp "Wi-Fi pairing code: " code
+  echo "Phone: Pair device with pairing code"
+  read -rp "IP address & port: " addr
+  read -rp "Code: " code
   adb_pair "$addr" "$code" || return 1
   finish_pairing "${addr%:*}"
 }
@@ -1933,12 +1932,10 @@ pair() {
   adb start-server &>/dev/null
 
   clear
-  echo "Pair your phone over Wi-Fi (same network as this computer)"
-  echo
-  echo "On the phone: Settings › Developer options › Wireless debugging (on)"
-  echo "              › Pair device with QR code, and scan this:"
   qrencode -t ansiutf8 -m 2 "WIFI:T:ADB;S:$name;P:$pass;;"
-  echo "Waiting for the phone… (c: use a pairing code instead, q: quit)"
+  echo "Phone: Wireless debugging › Pair device with QR code"
+  echo
+  echo "c  pairing code instead    q  quit"
 
   deadline=$((SECONDS + 300))
   while ((SECONDS < deadline)); do
@@ -1973,7 +1970,7 @@ wifi() {
   sleep 2
   if adb connect "$ip:5555" | grep -q "connected to"; then
     echo "$ip:5555" >"$TCP_FILE"
-    notify "Phone on Wi-Fi" "You can unplug the cable. This lasts until the phone restarts."
+    notify "Phone on Wi-Fi" "Unplug any time · until the phone restarts"
   else
     die "Couldn't reach the phone at $ip."
   fi
@@ -2000,9 +1997,9 @@ connect() {
   fi
 
   if is_tailnet_serial "$serial"; then
-    notify "Phone" "Connected to $(device_label "$serial") over Tailscale."
+    notify "Phone" "$(device_label "$serial") · Tailscale"
   else
-    notify "Phone" "Connected to $(device_label "$serial")."
+    notify "Phone" "$(device_label "$serial") · connected"
   fi
 }
 
@@ -2040,9 +2037,9 @@ disconnect() {
   # share it, though, so it stays up while any of those are connected.
   if [[ -z $(all_devices | usb_devices) ]]; then
     adb kill-server &>/dev/null
-    notify "Phone" "Disconnected. Open a phone app or the mirror to connect again."
+    notify "Phone" "Disconnected"
   else
-    notify "Phone" "Phone windows closed and Wi-Fi links dropped. adb stays running for your USB devices and emulators, so the phone may reconnect while Wireless debugging is on."
+    notify "Phone" "Disconnected · adb stays up for USB devices and emulators"
   fi
 }
 
@@ -2587,7 +2584,7 @@ main() {
     serial=$(pick_device) || exit 1
     refresh_apps "$serial"
     echo "Apps: $(wc -l <"$APPS_CACHE")"
-    notify "Phone" "Found $(wc -l <"$APPS_CACHE") apps on your phone."
+    notify "Phone" "$(wc -l <"$APPS_CACHE") apps"
     ;;
   status)
     if [[ ${1:-} == --json ]]; then

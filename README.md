@@ -26,7 +26,7 @@ git clone https://github.com/ljxw88/omarchy-phonelink ~/.local/share/omarchy-pho
 
 1. **Settings › About phone › Software information**: tap **Build number** 7 times.
 2. **Settings › Developer options**: turn on **Wireless debugging**.
-3. On the computer: **Omarchy menu › Phone › Wi-Fi › Pair with QR code**.
+3. On the computer: **Omarchy menu › Phone › Connection › Pair**.
    On the phone: **Wireless debugging › Pair device with QR code**, and scan it.
 
 From then on, the phone connects by itself whenever Wireless debugging is on.
@@ -36,19 +36,16 @@ Samsung: if debugging is greyed out or the mouse doesn't work, turn off
 
 ## Use
 
-| To | Do |
-|---|---|
-| Open a phone app in its own window | **Super + Alt + P** |
-| Mirror the whole phone | **Super + Alt + Shift + P** |
-| Play a window's sound on the computer or the phone | **Super + Alt + V** in that window |
-| See your phone, recent apps, connection | Click the **phone icon** in the bar |
-| Go back / home on the phone | Right-click / middle-click in a phone window |
-| See how the computer reaches the phone | Bar icon › **Network map** |
-| Find out why it's laggy | **Omarchy menu › Phone › Check connection** |
-| Disconnect | Bar icon › **Disconnect** |
+Click the **phone icon** in the bar. Tiles open the mirror or an app; the
+buttons along the top show the network, the direct link, the Phone menu and
+disconnect.
 
-Phone windows tile like any other window. More controls are in
-**Omarchy menu › Phone**.
+| Shortcut | |
+|---|---|
+| **Super + Alt + P** | Open an app |
+| **Super + Alt + Shift + P** | Mirror the phone |
+| **Super + Alt + V** | Sound here or on the phone |
+| Right / middle click in a phone window | Back / Home |
 
 ## Away from home
 

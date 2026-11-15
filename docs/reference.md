@@ -51,17 +51,17 @@ above the line that loads phonelink.
 
 ## The bar icon
 
-The icon is dimmed when no phone is connected. It turns your theme's accent
-color while a phone window is open.
+Dimmed: no phone. Accent color: a phone window is open.
 
-- **Left click** opens a panel with:
-  - the phone's name and how it's connected;
-  - Mirror, and your recent and pinned apps, each with a sound button;
-  - the Direct Wi-Fi link switch;
-  - Disconnect, or Connect and Pair when no phone is connected.
+- **Click** opens the panel. At the top: the phone, how it's connected, and
+  buttons for the network map, the direct link, the Phone menu and
+  disconnecting (or Connect and Pair when no phone is connected). Below: tiles
+  for Mirror, your recent and pinned apps, and All apps. An open window's tile
+  is filled and marked with a dot; the speaker in a tile's corner shows where
+  its sound plays and switches it.
 
-  In the panel, arrow keys or j/k move, Enter opens, S switches the sound and
-  Esc closes.
+  Arrow keys or h/j/k/l move, Enter opens, S switches the sound, N opens the
+  network map, Esc closes.
 - **Right click** mirrors the phone.
 - **Middle click** opens the full app list.
 
@@ -70,8 +70,8 @@ Move it by dragging it along the bar, or with
 
 ## The network map
 
-**Bar icon › Network map** (or `phonelink network --panel`, or **N** in the
-panel) shows every way this computer has to the phone, as a lane between the
+The map button at the top of the bar panel (or `phonelink network --panel`,
+or **N** in the panel) shows every way this computer has to the phone, as a lane between the
 two, with the address at each end:
 
 | Lane | This computer's address | The phone's address |
@@ -90,9 +90,9 @@ from the phone to this computer, and shows its round trip, data rate and any
 backlog. A solid line is connected but idle; a dashed one could connect. The
 Wi-Fi lane shows your router in the middle, and the Tailscale lane whether
 traffic goes direct or through a relay. Point at a lane, or move to it with
-the arrow keys, to read where its addresses came from. Below the lanes are the
-router, where the debugging port came from, the phone's mobile data address
-(from its carrier, and not reachable from here), and what's streaming.
+the arrow keys, to read where its addresses came from. Chips below show what's
+streaming and the phone's mobile data address (from its carrier, and not
+reachable from here).
 
 `phonelink network` prints the same map in a terminal, and
 `phonelink network --json` gives it as data.
