@@ -1,0 +1,15 @@
+name: Idea
+description: Something phonelink could do
+labels: [enhancement]
+body:
+  - type: textarea
+    id: idea
+    attributes:
+      label: What would you like phonelink to do?
+    validations:
+      required: true
+  - type: textarea
+    id: why
+    attributes:
+      label: Why
+      description: What you're trying to do, and what gets in the way today.

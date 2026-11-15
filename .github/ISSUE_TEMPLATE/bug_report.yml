@@ -1,0 +1,53 @@
+name: Bug report
+description: Something doesn't work as it should
+labels: [bug]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: And what you expected instead.
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. Press Super + Alt + P and open YouTube
+        2. …
+  - type: input
+    id: phone
+    attributes:
+      label: Phone and Android version
+      placeholder: Galaxy Z Fold, Android 17
+    validations:
+      required: true
+  - type: dropdown
+    id: connection
+    attributes:
+      label: Connection
+      multiple: true
+      options:
+        - USB
+        - Wi-Fi
+        - Direct link
+        - Tailscale
+        - Not sure
+  - type: input
+    id: omarchy
+    attributes:
+      label: Omarchy version
+      description: The output of `omarchy version`.
+  - type: textarea
+    id: doctor
+    attributes:
+      label: Output of `phonelink doctor`
+      description: It lists addresses and network names. Remove any you'd rather not post.
+      render: text
+  - type: textarea
+    id: log
+    attributes:
+      label: Log
+      description: Lines from `~/.local/state/phonelink/logs/sessions.log` around when it happened.
+      render: text

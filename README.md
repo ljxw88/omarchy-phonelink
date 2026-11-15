@@ -77,4 +77,6 @@ git -C ~/.local/share/omarchy-phonelink pull && ~/.local/share/omarchy-phonelink
 
 Settings, commands, troubleshooting and privacy: [docs/reference.md](docs/reference.md).
 
+Bug reports and pull requests are welcome: see [CONTRIBUTING.md](CONTRIBUTING.md).
+
 Built on [scrcpy](https://github.com/Genymobile/scrcpy). MIT license.

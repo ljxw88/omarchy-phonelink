@@ -3,6 +3,7 @@
 These steps are only for when the user asks you to install, update or remove
 omarchy-phonelink. If you're working on phonelink's code, don't run them: don't
 pull, install packages, run `install.sh` or `uninstall.sh`, or reload Hyprland.
+Follow [CONTRIBUTING.md](CONTRIBUTING.md) instead.
 Whatever the task, never run `phonelink stop` or `phonelink direct off` while
 the user has phone windows open, unless they ask: both close the connection
 those windows use.
