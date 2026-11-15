@@ -17,6 +17,8 @@
 #   phonelink refresh      Re-read the app list from the phone
 #   phonelink status       Show connected phones
 #   phonelink doctor       Check for common causes of lag and dropouts
+#   phonelink network      Show every way to the phone, with addresses and where they came from
+#   phonelink network --panel  Open the network map in the bar
 #
 # Each phone app runs on its own virtual display that resizes with its window,
 # so it tiles like a desktop app and leaves the phone's own screen alone.
@@ -1689,6 +1691,269 @@ status_json() {
        directSupported: $supported, mirrorOpen: $mirror, apps: $apps }'
 }
 
+# ---------------------------------------------------------------- network map
+
+# This computer's IPv4 addresses, default route and Wi-Fi link, as JSON.
+computer_facts() {
+  local wifi
+  wifi=$(wifi_iface)
+  {
+    echo "name $(uname -n)"
+    ip -4 -o addr show 2>/dev/null | awk '{ split($4, a, "/"); print "addr", $2, a[1], ($0 ~ / dynamic /) ? "dhcp" : "static" }'
+    ip -4 route show default 2>/dev/null | awk '{ for (i = 1; i < NF; i++) if ($i == "via") v = $(i + 1); else if ($i == "dev") d = $(i + 1); print "route", d, v }'
+    [[ -n $wifi ]] && echo "wifi $wifi"
+    [[ -n $wifi ]] && iw dev "$wifi" link 2>/dev/null | awk '
+      $1 == "Connected" { print "bssid", $3 }
+      $1 == "SSID:" { sub(/^[ \t]*SSID: /, ""); print "ssid", $0 }
+      $1 == "freq:" { print "freq", int($2) }
+      $1 == "signal:" { print "signal", $2 }'
+  } | jq -R -s '
+    split("\n") | map(select(length > 0)) as $l
+    | ($l | map(select(startswith("name "))) | first // "" | .[5:]) as $name
+    | ($l | map(select(startswith("wifi "))) | first // "" | .[5:]) as $wifi
+    | ($l | map(select(startswith("route ")) | split(" ") | { (.[1]): .[2] }) | add // {}) as $routes
+    | {
+        name: $name,
+        wifiIface: $wifi,
+        interfaces: [ $l[] | select(startswith("addr ")) | split(" ") | select(.[1] != "lo")
+          | { iface: .[1], ip: .[2], assigned: .[3], gateway: ($routes[.[1]] // null) } ],
+        ssid: ($l | map(select(startswith("ssid "))) | first // null | if . then .[5:] else null end),
+        bssid: ($l | map(select(startswith("bssid "))) | first // null | if . then .[6:] else null end),
+        freqMhz: ($l | map(select(startswith("freq "))) | first // null | if . then (.[5:] | tonumber) else null end),
+        signal: ($l | map(select(startswith("signal "))) | first // null | if . then (.[7:] | tonumber) else null end)
+      }'
+}
+
+# The phone's model, name and IPv4 addresses, and its Wi-Fi link, in one
+# round trip, as JSON. Empty when it can't be asked.
+phone_facts() {
+  [[ -n $1 ]] || return 0
+  timeout 5 adb -s "$1" shell 'getprop ro.product.model; settings get global device_name; ip -4 -o addr show; cmd wifi status 2>/dev/null' 2>/dev/null |
+    tr -d '\r' | jq -R -s '
+      split("\n") as $l
+      | ($l | map(capture("^[0-9]+: (?<iface>[^ ]+) +inet (?<ip>[0-9.]+)/[0-9]+.*?(?<dyn> dynamic)?(?:\\\\| |$)")?) | map(select(.iface != "lo"))) as $addrs
+      | ($l | map(capture("SSID: \"(?<v>[^\"]*)\"")?) | first // null) as $ssid
+      | {
+          model: ($l[0] // ""),
+          name: (($l[1] // "") | if . == "null" then "" else . end),
+          interfaces: [ $addrs[] | { iface, ip, assigned: (if .dyn then "dhcp" else "static" end) } ],
+          ssid: ($ssid.v // null),
+          bssid: ($l | map(capture("BSSID: (?<v>[0-9a-fA-F:]{17})")?) | first // null | if . then .v else null end),
+          rssi: ($l | map(capture("RSSI: (?<v>-?[0-9]+)")?) | first // null | if . then (.v | tonumber) else null end),
+          freqMhz: ($l | map(capture("Frequency: (?<v>[0-9]+)")?) | first // null | if . then (.v | tonumber) else null end),
+          txMbps: ($l | map(capture("Calculated Tx *: *(?<v>[0-9]+)")?) | first // null | if . then (.v | tonumber) else null end)
+        }'
+}
+
+# Prints "rtt-ms best-rtt-ms bytes-received" for the adb server's
+# connection to an address.
+link_detail() {
+  ss -tinpH state established "( dst $1 and dport = :$2 )" 2>/dev/null | awk -v want="pid=$3," '
+    /users:\(\(/ { mine = index($0, want) > 0; next }
+    mine { for (i = 1; i <= NF; i++) {
+        n = index($i, ":"); if (!n) continue
+        k = substr($i, 1, n - 1); v = substr($i, n + 1)
+        if (k == "rtt") { split(v, r, "/"); rtt = r[1] }
+        else if (k == "minrtt") min = v
+        else if (k == "bytes_received") rx = v
+      } }
+    END { if (rx != "") printf "%.1f %.1f %s\n", rtt, min, rx }'
+}
+
+# Live numbers for a connection, as JSON: round trip, backlog, and how fast
+# data arrives, worked out from the bytes received since the last look.
+link_json() {
+  local host=$1 port=$2 server=$3 rtt min rx now prev_t prev_rx mbps=null file="$STATE_DIR/netrate"
+  read -r rtt min rx < <(link_detail "$host" "$port" "$server")
+  [[ -n ${rx:-} ]] || { echo null; return; }
+  now=$(date +%s%3N)
+  read -r prev_t prev_rx < <(awk -v k="$host:$port" '$1 == k { print $2, $3 }' "$file" 2>/dev/null)
+  if [[ -n ${prev_t:-} ]] && ((now - prev_t > 200 && now - prev_t < 30000 && rx >= prev_rx)); then
+    mbps=$(awk -v b=$((rx - prev_rx)) -v t=$((now - prev_t)) 'BEGIN { printf "%.2f", b * 8 / t / 1000 }')
+  fi
+  { awk -v k="$host:$port" '$1 != k' "$file" 2>/dev/null; echo "$host:$port $now $rx"; } >"$file.tmp" && mv "$file.tmp" "$file"
+  jq -n --argjson rtt "$rtt" --argjson min "$min" --argjson mbps "$mbps" \
+    '{ rttMs: $rtt, queueMs: ([($rtt - $min), 0] | max), mbps: $mbps }'
+}
+
+# The open phone windows, from their scrcpy processes, as JSON lines.
+window_facts() {
+  local pid app argv serial title rate codec sound
+  for pid in $(pgrep -x scrcpy); do
+    app=$(tr '\0' '\n' <"/proc/$pid/environ" 2>/dev/null | sed -n 's/^SDL_APP_ID=//p')
+    [[ $app == phonelink* ]] || continue
+    mapfile -d '' -t argv <"/proc/$pid/cmdline" 2>/dev/null
+    serial="" title="" rate="" codec=h264 sound=false
+    for ((i = 0; i < ${#argv[@]}; i++)); do
+      case ${argv[i]} in
+      --no-video) sound=true ;;
+      -s) serial=${argv[i + 1]:-} ;;
+      --window-title=*) title=${argv[i]#*=} ;;
+      --video-bit-rate=*) rate=${argv[i]#*=} ;;
+      --video-codec=*) codec=${argv[i]#*=} ;;
+      esac
+    done
+    [[ -n $serial ]] || continue
+    jq -nc --arg app "$app" --arg title "$title" --arg serial "$serial" --arg path "$(path_of "$serial")" \
+      --arg rate "${rate:-8M}" --arg codec "$codec" --argjson sound "$sound" \
+      '{ app: $app, title: $title, serial: $serial, path: $path, sound: $sound,
+         bitRate: (if $sound then null else $rate end), codec: (if $sound then null else $codec end) }'
+  done
+}
+
+# Every way this computer has to the phone, which one the windows use, the
+# addresses at both ends, and where each address came from, as JSON.
+network_json() {
+  local ready usb="" direct="" direct_up=false direct_supported=false wifi_serial="" tail_serial="" tail_ip="" tail_port=""
+  local any="" computer phone windows server host port peer ts_ip ts_self mdns c
+  local direct_stats=null wifi_stats=null tail_stats=null tail_found=null tail_peer=null port_found=null wifi_found=null
+
+  if adb_running; then
+    ready=$(ready_devices)
+    usb=$(usb_devices <<<"$ready" | head -1)
+    [[ -s $DIRECT_FILE ]] && direct=$(<"$DIRECT_FILE")
+    direct_link_up && direct_up=true
+    [[ -n $direct ]] && $direct_up && grep -qxF "$direct" <<<"$ready" || direct=""
+    while read -r c; do
+      [[ -n $c && $c != "$direct" && $c != "$usb" ]] || continue
+      if is_tailnet_serial "$c"; then [[ -n $tail_serial ]] || tail_serial=$c; else [[ -n $wifi_serial ]] || wifi_serial=$c; fi
+    done <<<"$ready"
+    any=${usb:-${direct:-${wifi_serial:-$tail_serial}}}
+    server=$(adb_server_pid)
+    mdns=$(adb mdns services 2>/dev/null | awk '/_adb-tls-connect/ { print $1, $NF }')
+  fi
+  [[ -n $(p2p_device) ]] && direct_supported=true
+
+  computer=$(computer_facts)
+  phone=$(phone_facts "$any")
+  [[ -n $phone ]] || phone=null
+  windows=$(window_facts | jq -s '.')
+
+  # The router path: an mDNS name stands for the address it announced.
+  if [[ -n $wifi_serial ]]; then
+    read -r host port < <(transport_of "$wifi_serial")
+    [[ -n $host ]] && wifi_stats=$(link_json "$host" "$port" "$server")
+    if [[ $wifi_serial == *_adb-tls-connect* ]] || grep -q " $host:$port\$" <<<"$mdns"; then
+      wifi_found='"mdns"'
+    elif [[ -s $TCP_FILE && $(<"$TCP_FILE") == "$wifi_serial" ]]; then
+      wifi_found='"tcpip"'
+    else
+      wifi_found='"connected"'
+    fi
+    wifi_serial="$host:$port"
+  fi
+  if [[ -n $direct ]]; then
+    read -r host port < <(transport_of "$direct")
+    direct_stats=$(link_json "$host" "$port" "$server")
+  fi
+
+  # Tailscale: the address phonelink knows for the phone, and how it knows it.
+  if tailscale_enabled; then
+    ts_self=$(tailscale ip -4 2>/dev/null | head -1)
+    if [[ -n $tail_serial ]]; then
+      tail_ip=${tail_serial%:*} tail_port=${tail_serial##*:}
+      read -r host port < <(transport_of "$tail_serial")
+      tail_stats=$(link_json "$host" "$port" "$server")
+    elif ts_ip=$(tailnet_address); then
+      tail_ip=$ts_ip
+      [[ -s $TAILNET_FILE ]] && read -r _ tail_port <"$TAILNET_FILE"
+    fi
+    if [[ -n $TAILSCALE_HOST ]]; then
+      tail_found='"setting"'
+    elif [[ -s $TAILNET_FILE ]]; then
+      tail_found='"learned"'
+    elif [[ -n $tail_ip ]]; then
+      tail_found='"only-android"'
+    fi
+    if [[ -n $tail_ip ]]; then
+      peer=$(tailnet_peer "$tail_ip")
+      [[ -n $peer ]] && tail_peer=$(jq -c '{ name: .DNSName, online: .Online, active: .Active, direct: (if .CurAddr != "" then .CurAddr else null end), relay: (.Relay // null) }' <<<"$peer")
+    fi
+  fi
+
+  # Wireless debugging listens on one port on every network the phone is on.
+  for c in "$wifi_serial" "$direct" "$tail_serial"; do
+    [[ $c == *:* ]] || continue
+    port=${c##*:}
+    if grep -q ":$port\$" <<<"$mdns"; then port_found='"mdns"'; elif [[ $port == 5555 ]]; then port_found='"tcpip"'; else port_found='"remembered"'; fi
+    break
+  done
+
+  jq -n \
+    --argjson computer "$computer" --argjson phone "$phone" --argjson windows "$windows" \
+    --arg usb "$usb" --arg direct "$direct" --argjson directUp "$direct_up" --argjson directSupported "$direct_supported" \
+    --argjson directMcc "$(direct_mcc && echo true || echo false)" \
+    --arg wifi "$wifi_serial" --arg tail "${tail_ip:+$tail_ip${tail_port:+:$tail_port}}" --argjson tailConnected "$([[ -n $tail_serial ]] && echo true || echo false)" \
+    --arg tsSelf "${ts_self:-}" --argjson tailPeer "$tail_peer" --argjson tailFound "$tail_found" \
+    --argjson wifiFound "$wifi_found" --argjson portFound "$port_found" \
+    --argjson directStats "$direct_stats" --argjson wifiStats "$wifi_stats" --argjson tailStats "$tail_stats" '
+    def used($kind): [$windows[] | select(.path == $kind)] | length;
+    def state($kind; $connected; $possible): if used($kind) > 0 then "active" elif $connected then "connected" elif $possible then "available" else "off" end;
+    def iface($side; $match): [$side.interfaces[]? | select(.iface | test($match))] | first // null;
+    ($computer.interfaces | map(select(.iface == $computer.wifiIface)) | first // null) as $cw
+    | iface($computer; "^p2p-") as $cp
+    | iface($computer; "^tailscale") as $ct
+    | iface($phone; "^wlan") as $pw
+    | iface($phone; "^p2p") as $pp
+    | iface($phone; "^(tun|tailscale)") as $pt
+    | {
+        computer: { name: $computer.name, ssid: $computer.ssid, bssid: $computer.bssid, freqMhz: $computer.freqMhz, signal: $computer.signal },
+        phone: (if $phone then { name: $phone.name, model: $phone.model, ssid: $phone.ssid, bssid: $phone.bssid, freqMhz: $phone.freqMhz, rssi: $phone.rssi, txMbps: $phone.txMbps,
+                  mobile: (iface($phone; "^(rmnet|ccmni|rmnet_data)") | if . then .ip else null end) } else null end),
+        router: (if $cw and $cw.gateway then { ip: $cw.gateway, ssid: $computer.ssid,
+                  sameAccessPoint: (if $phone and $phone.bssid and $computer.bssid then (($phone.bssid | ascii_downcase) == ($computer.bssid | ascii_downcase)) else null end) } else null end),
+        port: { found: $portFound },
+        paths: [
+          { kind: "usb", state: state("usb"; $usb != ""; false), phone: (if $usb != "" then $usb else null end), computer: null, found: (if $usb != "" then "usb" else null end), link: null },
+          { kind: "direct", state: (if $directSupported | not then "unsupported" else state("direct"; $direct != ""; ($pp != null)) end),
+            phone: (if $direct != "" then $direct elif $pp then $pp.ip else null end),
+            computer: ($cp.ip // null), found: (if $direct != "" or $pp then "direct-owner" else null end),
+            otherChannel: $directMcc, link: $directStats },
+          { kind: "wifi", state: state("wifi"; $wifi != ""; ($pw != null and $cw != null)),
+            phone: (if $wifi != "" then $wifi elif $pw then $pw.ip else null end), computer: ($cw.ip // null),
+            assigned: { phone: ($pw.assigned // null), computer: ($cw.assigned // null) },
+            found: ($wifiFound // (if $pw then "phone" else null end)), link: $wifiStats },
+          { kind: "tailscale", state: state("tailscale"; $tailConnected; ($tail != "" and ($tailPeer.online // false))),
+            phone: (if $tail != "" then $tail else ($pt.ip // null) end), computer: (if $tsSelf != "" then $tsSelf else ($ct.ip // null) end),
+            found: $tailFound, peer: $tailPeer, link: $tailStats }
+        ],
+        windows: $windows
+      }'
+}
+
+# The same map, drawn for a terminal.
+network_text() {
+  local json
+  json=$(network_json)
+  jq -r '
+    def pad($n): tostring | . + (" " * ([$n - length, 0] | max));
+    def pathname: {usb: "USB", direct: "Direct link", wifi: "Wi-Fi", tailscale: "Tailscale"}[.];
+    def mark: {active: "●", connected: "◉", available: "○", off: "·", unsupported: "·"}[.];
+    def line: {active: "━━━━━━━━━━", connected: "──────────", available: "┄┄┄┄┄┄┄┄┄┄", off: "          ", unsupported: "          "}[.];
+    def stats: if .link then " · \(.link.rttMs) ms" + (if .link.mbps then " · \(.link.mbps) Mbit/s" else "" end) + (if .link.queueMs > 20 then " · \(.link.queueMs) ms backlog" else "" end) else "" end;
+    def where:
+      if .kind == "usb" then "Over the cable, by the phone'"'"'s serial number. No addresses involved."
+      elif .kind == "direct" then "Wi-Fi Direct: the phone runs this link, always takes 192.168.49.1, and gave this computer its address."
+        + (if .otherChannel then " It is on another channel than your Wi-Fi, so phonelink prefers the router." else "" end)
+      elif .kind == "wifi" then "Your router gave both addresses (DHCP)."
+        + ({mdns: " The phone announced itself over mDNS (Wireless debugging).", tcpip: " Set up with phonelink wifi over USB.", connected: "", phone: " Read from the phone itself."}[.found // ""] // "")
+      else "Tailscale assigns these."
+        + ({learned: " phonelink noted the phone'"'"'s while it was nearby, and checked it against your tailnet.", setting: " Set by TAILSCALE_HOST in your config.", "only-android": " It is the only Android device on your tailnet."}[.found // ""] // "")
+        + (if .peer and .peer.online == false then " The phone is offline on Tailscale." elif .peer.direct then " Direct path: \(.peer.direct)." elif .peer.active then " Relayed through \(.peer.relay)." else "" end)
+      end;
+    def state_text: {active: "in use", connected: "connected", available: "available", off: "not connected", unsupported: "not supported here"}[.];
+    "This computer: \(.computer.name)" + (if .computer.ssid then " on \(.computer.ssid)" else "" end),
+    "Phone: " + (if .phone then "\(.phone.name) (\(.phone.model))" + (if .phone.ssid then " on \(.phone.ssid)" else "" end) else "not reachable right now" end),
+    "",
+    (.paths[] |
+      "\(.state | mark) \(.kind | pathname | pad(12)) \((.computer // "") | pad(16)) \(.state | line) \((.phone // "") | pad(22)) \(.state | state_text)\(stats)",
+      (if .state == "off" or .state == "unsupported" then empty else "  " + (" " * 12) + " \(where)" end)),
+    (if .router then "", "Router: \(.router.ip)" + (if .router.sameAccessPoint == false then " · the phone and this computer use different access points" else "" end) else empty end),
+    (if .phone.mobile then "Also on the phone: mobile data \(.phone.mobile), from your carrier. Not reachable from here." else empty end),
+    (if (.windows | length) > 0 then "", "Streams:", (.windows[] | if .sound then "  Phone sound · \(.path | pathname)" else "  \(.title) · \(.path | pathname) · \(.bitRate)bit/s · \(.codec | ascii_upcase)" end) else empty end)
+  ' <<<"$json"
+}
+
 # ---------------------------------------------------------------- doctor
 
 # Checks the usual causes of lag and dropouts, and says what to do about each.
@@ -1839,6 +2104,14 @@ main() {
   wifi) require_tools; wifi ;;
   stop | disconnect) require_tools; disconnect ;;
   doctor) require_tools; doctor ;;
+  network)
+    require_tools
+    case ${1:-} in
+    --json) network_json ;;
+    --panel) omarchy-shell phonelink.panel network >/dev/null ;;
+    *) network_text ;;
+    esac
+    ;;
   refresh)
     require_tools
     serial=$(pick_device) || exit 1

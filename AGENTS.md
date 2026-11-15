@@ -89,6 +89,8 @@ This keeps scrcpy, adb and the user's settings in `~/.config/phonelink`.
 - Don't edit anything in `/usr/share/omarchy`.
 - Don't run `phonelink stop` or `phonelink direct off` while the user has phone
   windows open, unless they ask. Both close the connection those windows use.
+- To see which path the phone uses and where each address came from, run
+  `phonelink network`.
 - For lag or dropouts, run `phonelink doctor` first, then read
   `~/.local/state/phonelink/logs/sessions.log`, which records each window's
   quality changes and reconnections. More in

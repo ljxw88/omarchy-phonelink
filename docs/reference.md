@@ -5,6 +5,7 @@
 - [Requirements](#requirements)
 - [What the installer changes](#what-the-installer-changes)
 - [The bar icon](#the-bar-icon)
+- [The network map](#the-network-map)
 - [Inside a phone window](#inside-a-phone-window)
 - [Commands](#commands)
 - [Settings](#settings)
@@ -65,6 +66,35 @@ color while a phone window is open.
 Move it by dragging it along the bar, or with
 `omarchy bar move phonelink.panel --section <section>`.
 
+## The network map
+
+**Bar icon › Network map** (or `phonelink network --panel`, or **N** in the
+panel) shows every way this computer has to the phone, as a lane between the
+two, with the address at each end:
+
+| Lane | This computer's address | The phone's address |
+|---|---|---|
+| USB | None; the cable carries it | None; adb uses the phone's serial number |
+| Direct Wi-Fi | Handed out by the phone, which runs the link | Always 192.168.49.1 on a link the phone runs |
+| Wi-Fi | Handed out by your router (DHCP) | Handed out by your router. phonelink finds it in the phone's mDNS announcement |
+| Tailscale | Assigned by Tailscale | Assigned by Tailscale. phonelink notes it while the phone is nearby |
+
+The port after the phone's address is its Wireless debugging port. It's the
+same on every network the phone is on, and changes each time Wireless
+debugging is turned on.
+
+The lane in use is drawn in your theme's accent color, with traffic flowing
+from the phone to this computer, and shows its round trip, data rate and any
+backlog. A solid line is connected but idle; a dashed one could connect. The
+Wi-Fi lane shows your router in the middle, and the Tailscale lane whether
+traffic goes direct or through a relay. Point at a lane, or move to it with
+the arrow keys, to read where its addresses came from. Below the lanes are the
+router, where the debugging port came from, the phone's mobile data address
+(from its carrier, and not reachable from here), and what's streaming.
+
+`phonelink network` prints the same map in a terminal, and
+`phonelink network --json` gives it as data.
+
 ## Inside a phone window
 
 | | |
@@ -99,6 +129,8 @@ phonelink stop         Close phone windows and drop all connections
 phonelink refresh      Re-read the app list from the phone
 phonelink status       Show connected phones and open windows
 phonelink doctor       Check for common causes of lag and dropouts
+phonelink network      Show every way to the phone, with addresses and where they came from
+phonelink network --panel  Open the network map in the bar
 ```
 
 ## Settings

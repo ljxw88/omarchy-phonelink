@@ -4,6 +4,7 @@
   "phone.mirror": {"icon":"󰍹","label":"Mirror screen","action":"phonelink mirror"},
   "phone.pin": {"icon":"󰐃","label":"Pin apps to launcher","action":"phonelink pin"},
   "phone.refresh": {"icon":"󰑐","label":"Refresh app list","action":"phonelink refresh"},
+  "phone.network": {"icon":"󰛳","label":"Network map","description":"How this computer reaches your phone, and where each address comes from","action":"phonelink network --panel"},
   "phone.doctor": {"icon":"󰓙","label":"Check connection","description":"Find common causes of lag and dropouts","action":"omarchy-launch-floating-terminal-with-presentation phonelink doctor"},
   "phone.stop": {"icon":"󰅙","label":"Disconnect","description":"Close phone windows and drop all connections","action":"phonelink stop"},
   "phone.wireless": {"icon":"󰖩","label":"Wi-Fi"},
