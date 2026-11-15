@@ -5,6 +5,7 @@
   "phone.sound": {"icon":"󰽟","label":"Switch sound","description":"Play the phone window's sound on this computer or the phone","action":"phonelink sound toggle"},
   "phone.pin": {"icon":"󰐃","label":"Pin apps to launcher","action":"phonelink pin"},
   "phone.refresh": {"icon":"󰑐","label":"Refresh app list","action":"phonelink refresh"},
+  "phone.doctor": {"icon":"󰓙","label":"Check connection","description":"Find common causes of lag and dropouts","action":"omarchy-launch-floating-terminal-with-presentation phonelink doctor"},
   "phone.stop": {"icon":"󰅙","label":"Disconnect","description":"Close phone windows and drop all connections","action":"phonelink stop"},
   "phone.wireless": {"icon":"󰖩","label":"Wi-Fi"},
   "phone.wireless.direct": {"icon":"󱄙","label":"Direct link (faster)","description":"Wi-Fi Direct straight to the phone, skipping the router","when":"nmcli -t -f TYPE device 2>/dev/null | grep -qx wifi-p2p","checked":"nmcli -t -f NAME connection show --active | grep -qx phonelink-direct","action":"phonelink direct toggle"},

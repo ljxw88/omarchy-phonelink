@@ -2,6 +2,7 @@
   "phone": "Phone",
   "checking": "Checking…",
   "notConnected": "Not connected",
+  "reconnecting": "Reconnecting…",
   "viaDirect": "Direct Wi-Fi",
   "viaWifi": "Wi-Fi",
   "viaUsb": "USB",

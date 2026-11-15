@@ -3,7 +3,8 @@
 Use your Android phone on [Omarchy](https://omarchy.org). Open phone apps in
 their own windows, or mirror the whole screen, and control them with your mouse
 and keyboard. Works over Wi-Fi, USB, or Tailscale when you're away from home.
-Nothing to install on the phone.
+The video quality follows your connection, and windows reconnect by
+themselves when the network changes. Nothing to install on the phone.
 
 ## Install
 
@@ -42,6 +43,7 @@ Samsung: if debugging is greyed out or the mouse doesn't work, turn off
 | Play a window's sound on the computer or the phone | **Super + Alt + V** in that window |
 | See your phone, recent apps, connection | Click the **phone icon** in the bar |
 | Go back / home on the phone | Right-click / middle-click in a phone window |
+| Find out why it's laggy | **Omarchy menu › Phone › Check connection** |
 | Disconnect | Bar icon › **Disconnect** |
 
 Phone windows tile like any other window. More controls are in

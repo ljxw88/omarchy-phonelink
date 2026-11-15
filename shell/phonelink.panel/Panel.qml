@@ -32,6 +32,7 @@ Panel {
   property bool connected: false
   property string via: "none"
   property bool relayed: false
+  property bool reconnecting: false
   // Where the phone's sound plays now, and the mirror's own setting. Each app
   // carries its setting in `apps`.
   property string sound: "phone"
@@ -78,11 +79,12 @@ Panel {
     : strings.t("notConnected")
 
   readonly property string statusLabel: !loaded ? strings.t("checking")
+    : reconnecting ? strings.t("reconnecting")
     : connected && effectiveSound === "pc" ? strings.t("statusSoundHere").arg(viaLabel)
     : viaLabel
 
-  readonly property string tooltip: connected
-    ? strings.t("tooltipConnected").arg(deviceName || strings.t("phone")).arg(viaLabel)
+  readonly property string tooltip: connected || reconnecting
+    ? strings.t("tooltipConnected").arg(deviceName || strings.t("phone")).arg(statusLabel)
     : strings.t("tooltipDisconnected")
 
   // One flat list drives both the mouse and the keyboard cursor. Groups:
@@ -281,6 +283,7 @@ Panel {
       connected: !!data.connected,
       via: ["direct", "wifi", "usb", "tailscale"].indexOf(data.via) >= 0 ? data.via : "none",
       relayed: !!data.relayed,
+      reconnecting: !!data.reconnecting,
       name: typeof data.name === "string" ? data.name.slice(0, 80) : "",
       direct: !!data.direct,
       directSupported: !!data.directSupported,
@@ -298,6 +301,7 @@ Panel {
     connected = status.connected
     via = status.via
     relayed = status.relayed
+    reconnecting = status.reconnecting
     if (status.name !== "") deviceName = status.name
     directUp = status.direct
     directSupported = status.directSupported
