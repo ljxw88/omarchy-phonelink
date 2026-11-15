@@ -64,5 +64,6 @@
   "streamLine": "%1 · %2 · %3bit/s · %4",
   "streamSound": "Phone sound · %1",
   "chipSound": "Sound",
-  "thisComputer": "this computer"
+  "thisComputer": "this computer",
+  "removeTip": "Remove from here (X)"
 }

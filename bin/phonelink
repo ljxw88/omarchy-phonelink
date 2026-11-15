@@ -7,6 +7,7 @@
 #   phonelink open <pkg>   Open one phone app in its own window
 #   phonelink mirror       Mirror and control the whole phone screen
 #   phonelink pin          Choose which phone apps appear in the app launcher
+#   phonelink hide <pkg>   Take an app off the bar panel (opening it brings it back)
 #   phonelink pair         Pair over Wi-Fi with a QR code (Android 11+)
 #   phonelink connect      Connect to a paired phone, nearby or over Tailscale
 #   phonelink connect <port>  Reach the phone over Tailscale at this Wireless debugging port
@@ -46,6 +47,7 @@ STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/phonelink"
 LOG_DIR="$STATE_DIR/logs"
 APPS_CACHE="$STATE_DIR/apps.tsv"
 RECENT_FILE="$STATE_DIR/recent"
+HIDDEN_FILE="$STATE_DIR/hidden"
 TCP_FILE="$STATE_DIR/last-tcp"
 DIRECT_FILE="$STATE_DIR/direct-addr"
 DIRECT_PEER_FILE="$STATE_DIR/direct-peer"
@@ -767,6 +769,33 @@ record_recent() {
   tmp=$(mktemp)
   { echo "$1"; grep -vxF "$1" "$RECENT_FILE" 2>/dev/null; } | head -6 >"$tmp"
   mv "$tmp" "$RECENT_FILE"
+  unhide_app "$1"
+}
+
+# Removes $1 from the list in file $2.
+drop_line() {
+  local tmp
+  [[ -f $2 ]] || return 0
+  tmp=$(mktemp)
+  grep -vxF "$1" "$2" >"$tmp"
+  mv "$tmp" "$2"
+}
+
+# The bar panel lists recent and pinned apps. Hiding one forgets it as recent,
+# and keeps a pinned one off the panel while it stays in the launcher. Opening
+# or pinning the app again brings it back.
+hide_app() {
+  local pkg=$1
+  valid_pkg "$pkg" || die "Not an Android package name: $pkg"
+  mkdir -p "$STATE_DIR"
+  drop_line "$pkg" "$RECENT_FILE"
+  if is_pinned "$pkg" && ! grep -qxF "$pkg" "$HIDDEN_FILE" 2>/dev/null; then
+    echo "$pkg" >>"$HIDDEN_FILE"
+  fi
+}
+
+unhide_app() {
+  drop_line "$1" "$HIDDEN_FILE"
 }
 
 # ---------------------------------------------------------------- launcher entries
@@ -1860,7 +1889,7 @@ pin_menu() {
 
   while IFS=$'\t' read -r name pkg; do
     if grep -qxF "$pkg" <<<"$chosen"; then
-      is_pinned "$pkg" || write_entry "$pkg" "$name" false
+      is_pinned "$pkg" || { write_entry "$pkg" "$name" false && unhide_app "$pkg"; }
     elif is_pinned "$pkg"; then
       sed -i 's/^NoDisplay=false$/NoDisplay=true/' "$DESKTOP_DIR/phonelink.$pkg.desktop"
     fi
@@ -2114,7 +2143,7 @@ status_json() {
   classes=$(hyprctl clients -j 2>/dev/null | jq -r '.[].class' | grep '^phonelink' || true)
   grep -qxF phonelink <<<"$classes" && mirror=true
 
-  # Recently opened apps first, then pinned ones, at most eight.
+  # Recently opened apps first, then pinned ones not hidden, at most eight.
   apps=$(
     {
       cat "$RECENT_FILE" 2>/dev/null
@@ -2123,7 +2152,10 @@ status_json() {
         pkg=${pkg%.desktop}
         is_pinned "$pkg" && echo "$pkg"
       done
-    } | awk '!seen[$0]++' | head -8 | while read -r pkg; do
+    } | awk -v hidden="$HIDDEN_FILE" '
+      BEGIN { while ((getline line < hidden) > 0) skip[line] = 1 }
+      !skip[$0] && !seen[$0]++
+    ' | head -8 | while read -r pkg; do
       valid_pkg "$pkg" || continue
       icon="$ICON_DIR/phonelink.$pkg.png"
       [[ -s $icon ]] || icon=""
@@ -2564,6 +2596,7 @@ main() {
   open) require_tools; open_app "${1:?Usage: phonelink open <package>}" ;;
   mirror) require_tools; mirror ;;
   pin) require_tools; pin_menu ;;
+  hide) hide_app "${1:?Usage: phonelink hide <package>}" ;;
   pair) require_tools; pair ;;
   connect) require_tools; connect "${1:-}" ;;
   direct) require_tools; direct "${1:-on}" ;;

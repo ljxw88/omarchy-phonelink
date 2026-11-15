@@ -53,6 +53,12 @@ Panel {
   property var expectedPrefs: ({})
   property string expectedNow: ""
   property real soundDoneAt: 0
+  // Apps taken off the panel here run `phonelink hide` one at a time. Their
+  // tiles stay gone (`removed`) until a status check that started after the
+  // last of them comes back.
+  property var removeQueue: []
+  property var removed: ({})
+  property real removeDoneAt: 0
   property real statusStartedAt: 0
   property bool refreshQueued: false
   property bool queuedBrief: true
@@ -236,6 +242,29 @@ Panel {
     soundQueue = soundQueue.slice(1)
     soundProcess.command = [root.command, "sound", item.next, item.key]
     soundProcess.running = true
+  }
+
+  function removeApp(row) {
+    if (!row || row.kind !== "app") return
+    var pkg = row.app.package
+    var map = {}
+    for (var k in removed) map[k] = true
+    map[pkg] = true
+    removed = map
+    apps = apps.filter(function(app) { return app.package !== pkg })
+    removeQueue = removeQueue.concat([pkg])
+    if (!removeProcess.running) runNextRemove()
+  }
+
+  function runNextRemove() {
+    if (removeQueue.length === 0) {
+      removeDoneAt = Date.now()
+      refresh(!opened)
+      return
+    }
+    removeProcess.command = [root.command, "hide", removeQueue[0]]
+    removeQueue = removeQueue.slice(1)
+    removeProcess.running = true
   }
 
   function toggleDirect() {
@@ -530,7 +559,9 @@ Panel {
     if (status.name !== "") deviceName = status.name
     directUp = status.direct
     directSupported = status.directSupported
-    apps = status.apps
+    if (removeQueue.length === 0 && !removeProcess.running && removeDoneAt > 0 && status.startedAt >= removeDoneAt)
+      removed = ({})
+    apps = status.apps.filter(function(app) { return !root.removed[app.package] })
     sound = status.sound
     mirrorSound = status.mirrorSound
     loaded = true
@@ -569,6 +600,13 @@ Panel {
     running: false
     command: []
     onExited: Qt.callLater(root.runNextSound)
+  }
+
+  Process {
+    id: removeProcess
+    running: false
+    command: []
+    onExited: Qt.callLater(root.runNextRemove)
   }
 
   Process {
@@ -656,6 +694,7 @@ Panel {
       }
       onActivateRequested: if (!root.networkOpen && root.cursorActive && root.items[root.selectedIndex]) root.activate(root.items[root.selectedIndex].item)
       onCloseRequested: root.networkOpen ? root.closeNetwork() : root.close()
+      onDeleteRequested: if (!root.networkOpen && root.cursorActive && root.items[root.selectedIndex]) root.removeApp(root.items[root.selectedIndex].item)
       onTabRequested: function(direction) { root.switchPanel(direction) }
       onTextKey: function(t) {
         if (t === "m" || t === "M") root.activate({ kind: "mirror" })
@@ -859,7 +898,7 @@ Panel {
 
   // A tile: the app's icon and name. An open window's tile is filled and
   // marked with a dot. The speaker in the corner says where the window's
-  // sound plays, and switches it.
+  // sound plays, and switches it; an app's other corner takes it off the panel.
   component Tile: CursorSurface {
     id: tile
     required property var modelData
@@ -894,7 +933,7 @@ Panel {
     }
 
     PanelToolTip {
-      visible: tileMouse.containsMouse && !badgeMouse.containsMouse && tileName.truncated
+      visible: tileMouse.containsMouse && !badgeMouse.containsMouse && !removeMouse.containsMouse && tileName.truncated
       text: tile.label
       fontFamily: root.bar.fontFamily
     }
@@ -952,6 +991,41 @@ Panel {
       height: width
       radius: width / 2
       color: Commons.Color.accent
+    }
+
+    // Takes the app off the panel, on the tile under the pointer or cursor.
+    Rectangle {
+      visible: tile.kind === "app" && tile.hot
+      anchors.top: parent.top
+      anchors.left: parent.left
+      anchors.margins: Style.space(3)
+      width: Style.space(18)
+      height: width
+      radius: Style.cornerRadius
+      color: removeMouse.containsMouse ? root.hoverFill : "transparent"
+
+      Text {
+        anchors.centerIn: parent
+        textFormat: Text.PlainText
+        text: "󰅙"
+        color: removeMouse.containsMouse ? root.bar.foreground : Qt.darker(root.bar.foreground, 1.3)
+        font.family: root.bar.fontFamily
+        font.pixelSize: Style.font.bodySmall
+      }
+
+      MouseArea {
+        id: removeMouse
+        anchors.fill: parent
+        hoverEnabled: true
+        cursorShape: Qt.PointingHandCursor
+        onClicked: root.removeApp(tile.modelData)
+      }
+
+      PanelToolTip {
+        visible: removeMouse.containsMouse
+        text: strings.t("removeTip")
+        fontFamily: root.bar.fontFamily
+      }
     }
 
     // Where the sound plays: shown on open windows, and on the tile under the

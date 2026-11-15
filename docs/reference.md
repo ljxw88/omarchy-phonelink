@@ -58,10 +58,12 @@ Dimmed: no phone. Accent color: a phone window is open.
   disconnecting (or Connect and Pair when no phone is connected). Below: tiles
   for Mirror, your recent and pinned apps, and All apps. An open window's tile
   is filled and marked with a dot; the speaker in a tile's corner shows where
-  its sound plays and switches it.
+  its sound plays and switches it. The 󰅙 in an app's other corner takes it off
+  the panel (a pinned app stays in the launcher); opening it again brings it
+  back.
 
-  Arrow keys or h/j/k/l move, Enter opens, S switches the sound, N opens the
-  network map, Esc closes.
+  Arrow keys or h/j/k/l move, Enter opens, S switches the sound, X removes an
+  app, N opens the network map, Esc closes.
 - **Right click** mirrors the phone.
 - **Middle click** opens the full app list.
 
@@ -144,6 +146,7 @@ phonelink apps         Pick a phone app and open it in its own window
 phonelink open <pkg>   Open one phone app in its own window
 phonelink mirror       Mirror and control the whole phone screen
 phonelink pin          Choose which phone apps appear in the app launcher
+phonelink hide <pkg>   Take an app off the bar panel (opening it brings it back)
 phonelink pair         Pair over Wi-Fi with a QR code
 phonelink connect      Connect to a paired phone, nearby or over Tailscale
 phonelink connect <port>  Reach the phone over Tailscale at this Wireless debugging port
